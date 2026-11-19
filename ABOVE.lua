@@ -1,5 +1,5 @@
 --[[
- RHYE Hub | ABOVE Auto Hunt V3.0 — Reliable Detection & Combat Spacing
+ RHYE Hub | ABOVE Auto Hunt V4.0 — Search & Safe Spacing Fix
  PlaceId: 124357835578554
 
  Community client-side helper. Uses visible NPC models, PathfindingService,
@@ -43,12 +43,12 @@ local defaults = {
     mobWeapon = "Sword",
     attackRange = 5,
     autoKite = true, -- default: keep a safer distance from melee mobs
-    safeDistance = 4.2, -- ideal sword distance; ranged weapons auto prefer farther
+    safeDistance = 4.3, -- sword band centers around 4.3; ranged weapons keep farther
     lowHealthSafety = true, -- avoid chasing while critically low on HP
     lowHealthThreshold = 35, -- percent
 
     attackInterval = 0.50,
-    maxSearch = 250,
+    maxSearch = 300, -- target acquisition radius, independent of attack distance
     walkSpeed = 20,
     autoChase = true,
     autoEquip = true,
@@ -100,7 +100,7 @@ cfg.attackRange = math.clamp(cfg.attackRange,2,35)
 cfg.attackInterval = math.clamp(cfg.attackInterval,0.12,2)
 cfg.safeDistance = math.clamp(cfg.safeDistance,2.5,20)
 cfg.lowHealthThreshold = math.clamp(cfg.lowHealthThreshold,15,60)
-cfg.maxSearch = math.clamp(cfg.maxSearch,50,500)
+cfg.maxSearch = math.clamp(cfg.maxSearch,60,600)
 cfg.walkSpeed = math.clamp(cfg.walkSpeed,12,32)
 cfg.returnDelay = math.clamp(cfg.returnDelay,8,45)
 
@@ -113,6 +113,8 @@ local nextAttack, lastScan, lastNearScan = 0, 0, 0
 local lastHealthCheck, measuredHealthRatio, measuredCurrentHealth = 0, nil, nil
 local lastHealthReading, lastDamageAt, recovering = nil, -1e9, false
 local lastRetreatGoal, lastRetreatAt, lastRetreatEnemy = nil, 0, nil
+local kiteActive, kiteUntil, kiteTarget = false, 0, nil
+local lastMonsterScanCount, lastMonsterScanRadius = 0, 0
 local lastPortalScan = 0
 local portals = {}
 local portalAttemptAt, portalInteractAt, portalArrivalAt = 0, 0, 0
@@ -287,9 +289,14 @@ local function categoryOf(inst)
         or name:find("npc",1,true) or name:find("creature",1,true)
     if not actorHint then return nil end
     -- Some NPCs have generic names under typed enemy folders.
-    if inst.Parent and inst.Parent:IsA("Folder") then
-        local group=groupFromString(inst.Parent.Name)
+    -- In ABOVE some actors are named simply "NPC" or "Enemy" and their
+    -- category lives 1-4 containers above the model (e.g. NPCs/Slimes/Spawn).
+    local ancestor=inst.Parent
+    for _=1,4 do
+        if not ancestor or ancestor==Workspace then break end
+        local group=ownCategory(ancestor)
         if group then return group end
+        ancestor=ancestor.Parent
     end
     for _,child in ipairs(inst:GetChildren()) do
         if child:IsA("BasePart") or child:IsA("Model") then
@@ -380,63 +387,83 @@ local function refreshNPCs()
     end
     lastScan=os.clock()
 end
+-- Nearby and global scanning cooperate: a fast, uncapped local scan plus
+-- a less frequent complete Workspace index (handles non-queryable / streamed NPCs).
+-- "Search Radius" is the final acquisition filter, NOT the attack distance.
 local function scanNearbyNPCs(root)
     local now=os.clock()
-    if now-lastNearScan<0.75 then return end
+    if now-lastNearScan<0.85 then return end
     lastNearScan=now
     local overlap=OverlapParams.new()
     overlap.FilterType=Enum.RaycastFilterType.Exclude
     overlap.FilterDescendantsInstances=player.Character and {player.Character} or {}
-    overlap.MaxParts=650
-    local radius=math.min(125,cfg.maxSearch)
+    overlap.MaxParts=0 -- 0 = unlimited; the former 650 cap missed mobs near scenery
+    local radius=math.min(165,cfg.maxSearch) -- 3s global scan covers farther mobs
+    lastMonsterScanRadius=radius
     local ok,parts=pcall(function()
         return Workspace:GetPartBoundsInRadius(root.Position,radius,overlap)
     end)
-    if ok and parts then
-        for _,part in ipairs(parts) do
-            if ownCategory(part) then addNPC(part) end
-            local model=part:FindFirstAncestorOfClass("Model")
-            for _=1,3 do
-                if not model or model==Workspace then break end
-                if ownCategory(model) or model:FindFirstChildOfClass("Humanoid") then
-                    addNPC(model)
-                end
-                local parent=model.Parent
-                model=parent and parent:FindFirstAncestorOfClass("Model") or nil
+    if not ok or not parts then return end
+    local seen={}
+    local additions=0
+    for _,part in ipairs(parts) do
+        -- Standalone cube/part NPCs (including BlueSlime variants).
+        if not seen[part] and ownCategory(part) then
+            seen[part]=true
+            if addNPC(part) then additions=additions+1 end
+        end
+        -- Generic NPC body pieces are located through parent actors instead.
+        local node=part.Parent
+        for _=1,6 do
+            if not node or node==Workspace then break end
+            if node:IsA("Model") and not seen[node] then
+                seen[node]=true
+                if addNPC(node) then additions=additions+1 end
             end
+            node=node.Parent
         end
     end
+    lastMonsterScanCount=#npcCache
 end
 local function chooseTarget(root)
     local now=os.clock()
     local best,bestDist=nil,math.huge
+    local closestBlocked,blockedDist=nil,math.huge
     for _,npc in ipairs(npcCache) do
-        if targetAlive(npc) and (not blocked[npc] or blocked[npc]<=now) then
+        if targetAlive(npc) then
             local part=findRoot(npc)
             if part then
                 local dist=(part.Position-root.Position).Magnitude
-                if dist<bestDist and dist<=cfg.maxSearch then
-                    best,bestDist=npc,dist
+                if dist<=cfg.maxSearch then
+                    local isBlocked=blocked[npc] and blocked[npc]>now
+                    -- Monster visible close by should never disappear from selection
+                    -- solely because of a transient pathfinding failure.
+                    if not isBlocked or dist<22 then
+                        if dist<bestDist then best,bestDist=npc,dist end
+                    elseif dist<blockedDist then
+                        closestBlocked,blockedDist=npc,dist
+                    end
                 end
             end
         end
     end
-    if targetAlive(currentTarget) and (not blocked[currentTarget] or blocked[currentTarget]<=now) then
+    if targetAlive(currentTarget) then
         local part=findRoot(currentTarget)
         if part then
             local lockedDist=(part.Position-root.Position).Magnitude
-            if lockedDist<=cfg.maxSearch*1.4 then
-                -- Lock remains stable during combat, but a much closer Slime
-                -- should take priority over a distant/inaccessible one.
-                if best and best~=currentTarget and now-lastTargetSwitchAt>1.7
-                    and bestDist+8 < lockedDist and bestDist < lockedDist*0.58 then
+            if lockedDist<=cfg.maxSearch then
+                -- Do not abandon an actively engaged mob. Reacquire a much
+                -- closer spawn, however, when a distant mob was locked first.
+                if best and best~=currentTarget and now-lastTargetSwitchAt>1.2
+                    and bestDist+6<lockedDist and bestDist<lockedDist*0.63 then
                     return best
                 end
-                return currentTarget
+                if not blocked[currentTarget] or blocked[currentTarget]<=now
+                    or lockedDist<22 then return currentTarget end
             end
         end
     end
-    return best
+    return best or closestBlocked
 end
 local function matchingWeapon(tool,weapon)
     if not tool or not tool:IsA("Tool") then return false end
@@ -548,7 +575,7 @@ local function approachPoint(myPos,mobPart,mobModel,range)
     local away=flat(myPos-mobPos)
     if away.Magnitude<0.2 then away=Vector3.new(1,0,0) end
     away=away.Unit
-    local radius=math.max(1.5,range-0.65)
+    local radius=math.max(1.8,range-0.25)
     local angles={0,math.rad(30),-math.rad(30),math.rad(60),-math.rad(60),
         math.rad(100),-math.rad(100),math.rad(140),-math.rad(140),math.pi}
     local best,bestScore=nil,math.huge
@@ -570,6 +597,20 @@ local function approachPoint(myPos,mobPart,mobModel,range)
         end
     end
     if best then return best end
+    -- On uneven cliffs/rocks there may be no safe ring position near the
+    -- monster. Move a SHORT, grounded step toward it instead of returning the
+    -- player's own position (the V3 "detected but never approached" bug).
+    local toward=flat(mobPos-myPos)
+    if toward.Magnitude>2 then
+        local step=myPos+toward.Unit*math.min(5,toward.Magnitude-0.8)
+        local floorStep=findFloorAt(step,mobModel)
+        if floorStep and (not myFloor or math.abs(myFloor.Y-floorStep.Y)<3.5) then
+            local dest=Vector3.new(step.X,floorStep.Y+2.7,step.Z)
+            if los(myPos,dest,mobModel) and groundCorridor(myPos,dest,mobModel) then
+                return dest
+            end
+        end
+    end
     -- Never manufacture an ungrounded destination over a cliff.
     local floor=findFloorAt(myPos,mobModel)
     if floor then return Vector3.new(myPos.X,floor.Y+2.7,myPos.Z) end
@@ -631,16 +672,25 @@ local function safeRetreatPoint(from,enemyPos,enemy,needed)
     end
     return best
 end
-local function weaponCombatBounds()
+local function weaponCombatBounds(equippedTool)
     local kind=cfg.mobWeapon
-    local reach=kind=="Sword" and math.min(cfg.attackRange,5.3) or cfg.attackRange
-    local ideal=cfg.safeDistance
-    if kind=="Bow" or kind=="Scepter" then
-        ideal=math.max(ideal,math.min(11,reach-1))
+    if kind=="Equipped" and equippedTool then
+        if matchingWeapon(equippedTool,"Bow") then kind="Bow"
+        elseif matchingWeapon(equippedTool,"Scepter") then kind="Scepter"
+        else kind="Sword" end
     end
-    ideal=math.clamp(ideal,2.3,math.max(2.3,reach-0.35))
-    local minGap=math.max(1.8,ideal-0.9)
-    return reach,ideal,minGap
+    local sword=(kind=="Sword" or kind=="Equipped")
+    -- Sword's nominal 5.4 range from the reference UI is not a server promise;
+    -- keep 0.3 studs margin so the script actually walks close enough to hit.
+    local reach=sword and math.min(cfg.attackRange,5.1) or cfg.attackRange
+    local ideal=cfg.safeDistance
+    if not sword then
+        ideal=math.max(ideal,math.min(12,reach-1.5))
+    end
+    ideal=math.clamp(ideal,2.5,math.max(2.5,reach-(sword and 0.4 or 1.0)))
+    local retreatAt=math.max(1.7,ideal-(sword and 1.05 or 1.75))
+    local settleAt=math.min(reach-0.15,ideal+(sword and 0.25 or 0.6))
+    return reach,ideal,retreatAt,settleAt
 end
 local function currentHealthFraction(hum)
     -- Prefer explicit game's HUD health; ABOVE may show HP independently of Humanoid.Health.
@@ -948,6 +998,7 @@ local function stopHunt()
     activePortal=nil
     recovering=false
     lastRetreatGoal=nil
+    kiteActive=false;kiteTarget=nil;kiteUntil=0
     clearNavigation()
     local _,hum,root=getCharacter()
     if hum and root then hum:MoveTo(root.Position) end
@@ -1013,7 +1064,7 @@ local function button(parent,text,size)
 end
 
 gui = create("ScreenGui",{
-    Name="RHYE_ABOVE_AutoHunt_V3", ResetOnSpawn=false, IgnoreGuiInset=true,
+    Name="RHYE_ABOVE_AutoHunt_V4", ResetOnSpawn=false, IgnoreGuiInset=true,
     ZIndexBehavior=Enum.ZIndexBehavior.Sibling, DisplayOrder=10020,
 },player:WaitForChild("PlayerGui"))
 local main = create("Frame",{
@@ -1061,7 +1112,7 @@ hideNav.Position=UDim2.new(0,10,1,-52)
 local header=label(main,"RHYE Hub  /  Combat",18,true)
 header.Position=UDim2.fromOffset(93,19)
 header.Size=UDim2.fromOffset(370,25)
-local subtitle=label(main,"ABOVE · Reliable Detect + Survival V3",11,false,colors.muted)
+local subtitle=label(main,"ABOVE · Long-range Search + Combat Fix V4",11,false,colors.muted)
 subtitle.Position=UDim2.fromOffset(94,45)
 subtitle.Size=UDim2.fromOffset(370,20)
 local close=button(main,"×",24)
@@ -1089,7 +1140,7 @@ local infoFrame=create("Frame",{
 local infoLabel=label(infoFrame,"RHYE HUB  ·  ABOVE",23,true,colors.green)
 infoLabel.Size=UDim2.new(1,0,0,40)
 local infoBody=label(infoFrame,
-    "AUTO HUNT V3 · DETECTION + COMBAT SPACING\n\n1. Target: Slime (all kinds) OR Skeleton (all kinds).\n2. Adjust range, weapon and speed, then START.\n3. If home-return fails, bind HOME->HUB portal at Home,\n   then bind SLIME/RUINS portal at the Hub (if needed).\n4. All accounts on the same Potassium workspace share\n   RHYE_Hub/ABOVE_Global_Config.json.\n\nAnti-AFK: ON by default; success depends on executor.\nNo forced remote attacks or server combat bypass.\nStop or close with UI buttons.",
+    "AUTO HUNT V4 · SEARCH + SAFE SPACING\n\n1. Target: Slime (all kinds) OR Skeleton (all kinds).\n2. Use APPLY SWORD PRESET for recommended starting values.\n3. Search Radius finds NPCs; Attack Range controls hits.\n4. If home-return fails, bind HOME->HUB portal at Home,\n   then bind SLIME/RUINS portal at the Hub (if needed).\n5. All accounts using the same Potassium workspace share\n   RHYE_Hub/ABOVE_Global_Config.json.\n\nNo guaranteed invulnerability; monster AI and server rules\nmay still deal damage. Anti-AFK success depends on executor.",
     13,false,colors.muted)
 infoBody.Size=UDim2.new(1,-18,1,-60)
 infoBody.Position=UDim2.fromOffset(0,50)
@@ -1119,6 +1170,7 @@ local function settingRow(title,description,height)
     desc.TextWrapped=false
     return frame
 end
+local renderSetting={}
 local function toggleRow(title,description,key)
     local frame=settingRow(title,description)
     local control=button(frame,"",12)
@@ -1129,6 +1181,7 @@ local function toggleRow(title,description,key)
         control.Text=cfg[key] and "ON" or "OFF"
     end
     update()
+    renderSetting[key]=update
     remember(control.MouseButton1Click:Connect(function()
         cfg[key]=not cfg[key];update()
         changed(key=="autoSave")
@@ -1168,6 +1221,7 @@ local function cycleRow(title,description,key,options)
     control.Position=UDim2.new(1,-191,0,15)
     local function update() control.Text=tostring(cfg[key]) .. "  ▾" end
     update()
+    renderSetting[key]=update
     remember(control.MouseButton1Click:Connect(function()
         local idx=1
         for i,v in ipairs(options) do if v==cfg[key] then idx=i break end end
@@ -1231,6 +1285,7 @@ local function sliderRow(title,description,key,minValue,maxValue,increment,suffi
         if input.UserInputType==Enum.UserInputType.MouseButton1 or input.UserInputType==Enum.UserInputType.Touch then dragging=false end
     end))
     update()
+    renderSetting[key]=update
     return frame
 end
 
@@ -1241,18 +1296,35 @@ cycleRow("Target Mobs","Slime = ALL slimes; Skeleton = ALL skeletons.","targetGr
 cycleRow("Mob Weapon","Equip via Tool when available; otherwise use hotbar.","mobWeapon",{"Sword","Bow","Scepter","Equipped"})
 
 section("ATTACK & SMOOTH MOVEMENT")
-sliderRow("Attack Range","Max allowed distance; actual sword reach is about 5.4.","attackRange",2,35,0.5," st")
+sliderRow("Attack Range","Combat limit (Sword capped near 5.1). NOT monster detection range.","attackRange",2,35,0.5," st")
 toggleRow("Auto Combat Spacing","Back away when mobs get too close; resume attacking.","autoKite")
-sliderRow("Safe Combat Distance","Preferred gap for Sword; Bow/Scepter prefer longer range.","safeDistance",2.5,20,0.5," st")
+sliderRow("Safe Combat Distance","Preferred spacing. Sword: start at 4-4.5; stay within actual reach.","safeDistance",2.5,20,0.5," st")
 toggleRow("Low HP Survival","Retreat and pause attack until HP recovers.","lowHealthSafety")
 sliderRow("Low HP Threshold","Start defensive retreat under this percent HP.","lowHealthThreshold",15,60,5,"%")
 sliderRow("Attack Interval","Added delay, does not bypass game cooldown.","attackInterval",0.15,2,0.05," s")
-sliderRow("Search Radius","Search visible monsters within this radius.","maxSearch",50,500,10," st")
+sliderRow("Search Radius","Mob detection ONLY (separate from Attack Range). Requires client streaming.","maxSearch",60,600,10," st")
 sliderRow("Walk Speed","Client Humanoid speed while hunting; may be limited.","walkSpeed",12,32,1,"")
 cycleRow("Attack Method","Mouse = game LMB; Tool = Tool:Activate().","attackMode",{"Mouse","Tool","Auto"})
 toggleRow("Auto Chase","Stable waypoint movement + walls/path rechecks.","autoChase")
 toggleRow("Auto Equip","Try equipping a matching Roblox Tool.","autoEquip")
 toggleRow("Auto Aim","Aim camera at your target when attacking.","autoAim")
+local presetRow=settingRow("Recommended Sword Preset","Search 300 / Attack 5 / Gap 4.3 / HP safety ON.",62)
+local presetButton=button(presetRow,"APPLY PRESET",11)
+presetButton.Size=UDim2.fromOffset(146,29)
+presetButton.Position=UDim2.new(1,-161,0,16)
+remember(presetButton.MouseButton1Click:Connect(function()
+    local preset={mobWeapon="Sword",attackRange=5,safeDistance=4.3,
+        maxSearch=300,walkSpeed=22,attackInterval=0.5,
+        autoKite=true,lowHealthSafety=true,lowHealthThreshold=40}
+    for key,value in pairs(preset) do
+        cfg[key]=value
+        if renderSetting[key] then renderSetting[key]() end
+    end
+    kiteActive=false;kiteTarget=nil;lastRetreatGoal=nil
+    clearNavigation()
+    changed(true)
+    setStatus("Sword preset applied. Watch actual damage; safety not guaranteed")
+end))
 local mobScanRow=settingRow("Mob Detection Debug","Re-scan nearby mobs; print identified models to Developer Console (F9).",61)
 local mobScanBtn=button(mobScanRow,"SCAN MOBS (F9)",11)
 mobScanBtn.Size=UDim2.fromOffset(146,29)
@@ -1280,7 +1352,7 @@ remember(mobScanBtn.MouseButton1Click:Connect(function()
                 end
             end
         end
-        setStatus("Mob scan: "..tostring(#npcCache).." found. See F9 logs")
+        setStatus("Mob scan: "..tostring(#npcCache).." cached | search "..cfg.maxSearch.." st (F9)")
     end)
 end))
 
@@ -1428,6 +1500,7 @@ remember(player.CharacterAdded:Connect(function()
     lastEnemySeen=os.clock()-cfg.returnDelay
     recovering=false
     lastRetreatGoal=nil
+    kiteActive=false;kiteTarget=nil;kiteUntil=0
     lastHealthReading=nil
     measuredHealthRatio=nil
     clearNavigation()
@@ -1461,7 +1534,7 @@ end)
 task.spawn(function()
     while not closed do
         task.wait(1.5)
-        if os.clock()-lastScan>5 then pcall(refreshNPCs) end
+        if os.clock()-lastScan>3 then pcall(refreshNPCs) end
         if cfg.autoReturn and os.clock()-lastPortalScan>10 then pcall(scanPortals) end
     end
 end)
@@ -1507,6 +1580,7 @@ task.spawn(function()
                 clearNavigation()
                 nextAttack=0
                 lastApproachTarget=nil
+                lastRetreatGoal=nil;kiteActive=false;kiteTarget=nil
             end
             local part=findRoot(target)
             if not part then
@@ -1516,33 +1590,55 @@ task.spawn(function()
             local distance=(part.Position-root.Position).Magnitude
             local hDistance=horizontalDistance(part.Position,root.Position)
             local hp,known=healthInfo(target)
-            targetText.Text=string.format("Target: %s  ·  %.1f st%s",target.Name,distance,
-                known and string.format("  ·  HP %.0f",hp) or "")
             local tool=equipWeapon(character,hum,cfg.mobWeapon)
-            local attackReach,idealGap,tooClose=weaponCombatBounds()
+            local attackReach,idealGap,tooClose,settleAt=weaponCombatBounds(tool)
+            targetText.Text=string.format("%s · %.1f st | Atk %.1f | Gap %.1f%s",target.Name,distance,
+                attackReach,idealGap,known and string.format(" | HP %.0f",hp) or "")
             local inRange=distance<=attackReach and los(root.Position,part.Position,target)
 
-            -- A critical HP state is more important than farming: back away, pause combat.
             if cfg.lowHealthSafety and measuredHealthRatio then
-                if measuredHealthRatio <= cfg.lowHealthThreshold/100 then recovering=true end
-                if recovering and measuredHealthRatio >= math.max(0.60,cfg.lowHealthThreshold/100+0.23) then
+                if measuredHealthRatio<=cfg.lowHealthThreshold/100 then recovering=true end
+                if recovering and measuredHealthRatio>=math.max(0.60,cfg.lowHealthThreshold/100+0.23) then
                     recovering=false
                 end
             else
                 recovering=false
             end
-            local recentHit=(now-lastDamageAt<1.4)
-            local retreat=cfg.autoKite and (hDistance<tooClose
-                or (recentHit and hDistance<attackReach+3))
-            if recovering then retreat=true end
+
+            -- Hysteresis: the V3 loop treated every recently received hit as
+            -- an order to retreat when the mob was <reach+3 studs away. That
+            -- pulled swords OUT of attack range and made the character oscillate.
+            if kiteTarget~=target then
+                kiteActive=false
+                kiteUntil=0
+                kiteTarget=target
+                lastRetreatGoal=nil
+            end
+            local recentHit=(now-lastDamageAt<0.85)
+            if cfg.autoKite then
+                if hDistance<tooClose then
+                    kiteActive=true
+                    kiteUntil=now+0.55
+                elseif recentHit and hDistance<idealGap+0.2 then
+                    kiteActive=true
+                    kiteUntil=math.max(kiteUntil,now+0.55)
+                elseif hDistance>=settleAt and now>=kiteUntil then
+                    kiteActive=false
+                end
+                if hDistance>=settleAt+0.6 then
+                    kiteActive=false
+                end
+            else
+                kiteActive=false
+            end
+            local retreat=(recovering or kiteActive) and cfg.autoChase
 
             if retreat then
-                local required=math.max(idealGap-hDistance+0.8,2.8)
-                if recovering then required=math.max(required,6.5) end
-                if recentHit then required=math.max(required,4.5) end
+                local desired=idealGap+(recovering and 3.0 or 0)
+                local required=math.max(2.1,desired-hDistance+0.35)
                 if lastRetreatEnemy~=target or not lastRetreatGoal
-                    or now-lastRetreatAt>0.72
-                    or horizontalDistance(root.Position,lastRetreatGoal)<1.2 then
+                    or now-lastRetreatAt>0.95
+                    or horizontalDistance(root.Position,lastRetreatGoal)<1.0 then
                     lastRetreatGoal=safeRetreatPoint(root.Position,part.Position,target,required)
                     lastRetreatEnemy=target
                     lastRetreatAt=now
@@ -1552,14 +1648,17 @@ task.spawn(function()
                     if not success and nav.failures>=3 then
                         clearNavigation()
                         lastRetreatGoal=nil
+                        kiteActive=false
                     end
-                    setStatus(recovering and "LOW HP: retreating; combat paused"
-                        or (success and "Kiting "..target.Name.." ["..info.."]"
-                        or "Kiting: no safe route, avoid cliff"))
+                    setStatus(recovering and "LOW HP: trying to retreat; attacks paused"
+                        or (success and "Spacing from "..target.Name.." ["..info.."]"
+                        or "Spacing: no safe path; keep combat if possible"))
                 else
-                    -- No blindly crossing water, cliff, or wall for an impossible dodge.
+                    -- Keep fighting in range rather than standing idle when
+                    -- terrain offers no safe retreat (this is not invulnerability).
+                    kiteActive=false
                     if nav.subject then clearNavigation();hum:MoveTo(root.Position) end
-                    setStatus("No safe dodge point (cliff / wall). Avoiding unsafe movement")
+                    setStatus("No safe retreat point; continuing if in range")
                 end
                 if not recovering and inRange and now>=nextAttack then
                     nextAttack=now+cfg.attackInterval
@@ -1581,30 +1680,32 @@ task.spawn(function()
                 lastRetreatGoal=nil
                 if lastApproachTarget~=target or not approachCache or now-approachAt>1.0
                     or (mobCachePos and horizontalDistance(part.Position,mobCachePos)>3) then
-                    approachCache=approachPoint(root.Position,part,target,attackReach)
+                    approachCache=approachPoint(root.Position,part,target,idealGap)
                     approachAt=now
                     lastApproachTarget=target
                     mobCachePos=part.Position
                 end
                 local success,info=navMove(hum,root,approachCache,target,target)
                 if not success and nav.failures>=3 then
-                    blocked[target]=now+5
-                    currentTarget=nil
+                    -- A path failure should not make a mob standing right in
+                    -- front of the player "disappear" from Auto Hunt.
+                    if distance>24 then blocked[target]=now+1.8 end
                     clearNavigation()
-                    setStatus("Route blocked near "..target.Name.."; trying others")
+                    if distance>24 then currentTarget=nil end
+                    setStatus("Replanning path to "..target.Name)
                 elseif not success then
                     setStatus("Path to "..target.Name..": "..info)
                 else
                     setStatus("Chasing "..target.Name.." ["..info.."]")
                 end
             else
-                setStatus("Target outside actual Attack Range: "..target.Name)
+                setStatus("Target detected but outside Attack Range: "..target.Name)
             end
         else
             currentTarget=nil
             lastApproachTarget=nil
             lastRetreatGoal=nil
-            targetText.Text="Target: none ("..cfg.targetGroup..")"
+            targetText.Text=string.format("Target: none (%s) | Search %.0f st | Cache %d",cfg.targetGroup,cfg.maxSearch,#npcCache)
             if recovering and cfg.lowHealthSafety and measuredHealthRatio
                 and measuredHealthRatio<math.max(0.60,cfg.lowHealthThreshold/100+0.23) then
                 if nav.subject then clearNavigation();hum:MoveTo(root.Position) end
@@ -1666,5 +1767,5 @@ end)
 
 setStatus(loadedConfig and "Loaded shared config | "..cfg.targetGroup.." | Anti-AFK "..(cfg.autoAfk and "ON" or "OFF")
     or "Ready | Shared config | Anti-AFK ON")
-print("[RHYE ABOVE] V3 Reliable Hunt loaded. Shared config: "..CONFIG_FILE)
+print("[RHYE ABOVE] V4 Search + Combat Spacing loaded. Shared config: "..CONFIG_FILE)
 print("[RHYE ABOVE] Group: "..cfg.targetGroup.."  AutoReturn: "..tostring(cfg.autoReturn).."  AutoAFK: "..tostring(cfg.autoAfk))
