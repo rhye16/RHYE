@@ -1,5 +1,5 @@
 --[[
- RHYE Hub | ABOVE Auto Hunt V5.0 — Smooth Navigation & Nearest Target Fix
+ RHYE Hub | ABOVE Auto Hunt V6.0 — Smoother Walking + Portal Teleport
  PlaceId: 124357835578554
 
  Community client-side helper. Uses visible NPC models, PathfindingService,
@@ -50,6 +50,8 @@ local defaults = {
     attackInterval = 0.50,
     maxSearch = 300, -- target acquisition radius, independent of attack distance
     walkSpeed = 20,
+    walkMethod = "MoveTo", -- MoveTo is safest; Steering is optional continuous local movement
+    teleportDestination = "Slime", -- manual portal travel: Slime or Ruins
     autoChase = true,
     autoEquip = true,
     autoAim = true,
@@ -103,6 +105,8 @@ cfg.lowHealthThreshold = math.clamp(cfg.lowHealthThreshold,15,60)
 cfg.maxSearch = math.clamp(cfg.maxSearch,60,600)
 cfg.walkSpeed = math.clamp(cfg.walkSpeed,12,32)
 cfg.returnDelay = math.clamp(cfg.returnDelay,8,45)
+if cfg.walkMethod~="MoveTo" and cfg.walkMethod~="Steering" then cfg.walkMethod="MoveTo" end
+if cfg.teleportDestination~="Slime" and cfg.teleportDestination~="Ruins" then cfg.teleportDestination="Slime" end
 
 local running, closed = false, false
 local connections = {}
@@ -119,6 +123,14 @@ local lastPortalScan = 0
 local portals = {}
 local portalAttemptAt, portalInteractAt, portalArrivalAt = 0, 0, 0
 local activePortal = nil
+-- Manual teleport choice follows valid in-game portals. Never assumes a
+-- client-side CFrame movement is an authoritative server teleport.
+local manualTravel = {
+    active=false, destination=nil, started=0, portal=nil,
+    enteredAt=0, enteredPos=nil, avoidObject=nil, avoidUntil=0,
+    lastTransition=0, lastScan=0, directDestination=false,
+    lastArrivalCheck=0,
+}
 local lastCharacter = nil
 local gui, statusText, targetText, farmButton
 local lastStatus = "Ready"
@@ -129,6 +141,9 @@ local nav = {
     progressGoal=nil, progressDistance=nil, progressAt=0,
     failures=0, retryNow=false, lastFallbackAt=0,
     lastRouteWarningAt=0, lastPathError=nil,
+    lastGoalChangedAt=0, lastPathRequestGoal=nil, lastPathRequestAt=0,
+    steerGoal=nil, steerHum=nil, lastBestDist=nil, lastMovedPos=nil,
+    lastMovedAt=0, pathRequestId=0, routeUnreachableUntil=0,
 }
 local blocked = setmetatable({},{__mode="k"})
 
@@ -413,41 +428,58 @@ end
 -- Nearby and global scanning cooperate: a fast, uncapped local scan plus
 -- a less frequent complete Workspace index (handles non-queryable / streamed NPCs).
 -- "Search Radius" is the final acquisition filter, NOT the attack distance.
-local function scanNearbyNPCs(root)
+local nearScanBusy=false
+local function scanNearbyNPCs(root,immediate)
     local now=os.clock()
-    if now-lastNearScan<1.15 then return end
+    if nearScanBusy or (not immediate and now-lastNearScan<1.45) then return end
     lastNearScan=now
-    local overlap=OverlapParams.new()
-    overlap.FilterType=Enum.RaycastFilterType.Exclude
-    overlap.FilterDescendantsInstances=player.Character and {player.Character} or {}
-    overlap.MaxParts=0 -- 0 = unlimited; the former 650 cap missed mobs near scenery
-    local radius=math.min(110,cfg.maxSearch) -- global/event index covers longer range
-    lastMonsterScanRadius=radius
-    local ok,parts=pcall(function()
-        return Workspace:GetPartBoundsInRadius(root.Position,radius,overlap)
-    end)
-    if not ok or not parts then return end
-    local seen={}
-    local additions=0
-    for _,part in ipairs(parts) do
-        -- Standalone cube/part NPCs (including BlueSlime variants).
-        if not seen[part] and ownCategory(part) then
-            seen[part]=true
-            if addNPC(part) then additions=additions+1 end
-        end
-        -- Generic NPC body pieces are located through parent actors instead.
-        local node=part.Parent
-        for _=1,6 do
-            if not node or node==Workspace then break end
-            if node:IsA("Model") and not seen[node] then
-                seen[node]=true
-                if addNPC(node) then additions=additions+1 end
+    nearScanBusy=true
+    local center=root.Position
+    local function doScan()
+        local overlap=OverlapParams.new()
+        overlap.FilterType=Enum.RaycastFilterType.Exclude
+        overlap.FilterDescendantsInstances=player.Character and {player.Character} or {}
+        overlap.MaxParts=0 -- unlimited: scanning MUST not miss NPCs behind scenery
+        local radius=math.min(115,cfg.maxSearch)
+        lastMonsterScanRadius=radius
+        local ok,parts=pcall(function()
+            return Workspace:GetPartBoundsInRadius(center,radius,overlap)
+        end)
+        if ok and parts then
+            local seen={}
+            for i,part in ipairs(parts) do
+                if closed then break end
+                if not seen[part] and ownCategory(part) then
+                    seen[part]=true
+                    addNPC(part)
+                end
+                local node=part.Parent
+                for _=1,5 do
+                    if not node or node==Workspace then break end
+                    if node:IsA("Model") and not seen[node] then
+                        seen[node]=true
+                        addNPC(node)
+                    end
+                    node=node.Parent
+                end
+                if not immediate and i%160==0 then task.wait() end
             end
-            node=node.Parent
         end
+        lastMonsterScanCount=#npcCache
+        nearScanBusy=false
     end
-    lastMonsterScanCount=#npcCache
+    if immediate then doScan()
+    else
+        task.spawn(function()
+            local ok,err=pcall(doScan)
+            if not ok then
+                nearScanBusy=false
+                warn("[RHYE ABOVE] Nearby scan error: "..tostring(err))
+            end
+        end)
+    end
 end
+
 local function chooseTarget(root)
     local now=os.clock()
     local best,bestDist=nil,math.huge
@@ -456,12 +488,12 @@ local function chooseTarget(root)
         if targetAlive(npc) then
             local part=findRoot(npc)
             if part then
-                local d=part.Position-root.Position
-                local dist=Vector3.new(d.X,0,d.Z).Magnitude
-                local height=math.abs(part.Position.Y-root.Position.Y)
+                local delta=part.Position-root.Position
+                local dist=Vector3.new(delta.X,0,delta.Z).Magnitude
+                local height=math.abs(delta.Y)
                 if dist<=cfg.maxSearch and height<=35 then
-                    local temporaryBlocked=blocked[npc] and blocked[npc]>now
-                    if not temporaryBlocked or dist<=cfg.attackRange+1 then
+                    local skipped=blocked[npc] and blocked[npc]>now
+                    if not skipped or dist<=cfg.attackRange+1.5 then
                         if dist<bestDist then best,bestDist=npc,dist end
                     end
                     if npc==currentTarget then currentDist=dist end
@@ -469,21 +501,18 @@ local function chooseTarget(root)
             end
         end
     end
-    if targetAlive(currentTarget) and currentDist<=cfg.maxSearch then
-        local blockedCurrent=blocked[currentTarget] and blocked[currentTarget]>now
-        if blockedCurrent and currentDist>cfg.attackRange+1 then
-            return best -- temporarily try another live mob instead of stuck loops
-        end
-        if not best or best==currentTarget then return currentTarget end
-        local recentlySwitched=now-lastTargetSwitchAt<1.8
-        local nearCombat=currentDist<=cfg.attackRange+1.0
-        local clearlyCloser=(currentDist-bestDist)>=math.max(3.0,currentDist*0.18)
-        if not recentlySwitched and not nearCombat and clearlyCloser then
-            return best
-        end
-        return currentTarget
+    if not targetAlive(currentTarget) or currentDist>cfg.maxSearch then return best end
+    if blocked[currentTarget] and blocked[currentTarget]>now and currentDist>cfg.attackRange+1.5 then
+        return best
     end
-    return best
+    if not best or currentTarget==best then return currentTarget end
+    -- Keep a stable target for at least a short moment; however don't ignore
+    -- another mob significantly closer (V5's near-combat lock caused misses).
+    if now-lastTargetSwitchAt<1.4 then return currentTarget end
+    if bestDist+3.5<currentDist and bestDist<currentDist*0.72 then
+        return best
+    end
+    return currentTarget
 end
 
 local function matchingWeapon(tool,weapon)
@@ -584,15 +613,34 @@ local function findFloorAt(position,excluded)
 end
 local function groundCorridor(from,to,excluded)
     local dist=horizontalDistance(from,to)
-    if dist<2 then return true end
-    for t=0.25,0.75,0.25 do
-        local sample=from:Lerp(to,t)
-        if not findFloorAt(sample,excluded) then return false end
+    if dist<2.2 then return true end
+    local steps=math.clamp(math.ceil(dist/5),2,12)
+    local lastFloor=findFloorAt(from,excluded)
+    for i=1,steps do
+        local pt=from:Lerp(to,i/steps)
+        local floor=findFloorAt(pt,excluded)
+        if not floor then return false end
+        -- Avoid high ledges. Pathfinding should select slopes or proper jumps.
+        if lastFloor and math.abs(floor.Y-lastFloor.Y)>4.5 then return false end
+        lastFloor=floor
     end
     return true
 end
+
 local function approachPoint(myPos,mobPart,mobModel,range)
     local mobPos=mobPart.Position
+    -- Far chase uses a fixed approach offset. Don't generate a new ring point
+    -- around a moving monster every frame or the avatar will zig-zag.
+    local longDistance=horizontalDistance(myPos,mobPos)
+    if longDistance>24 then
+        local away=flat(myPos-mobPos)
+        if away.Magnitude>0.2 then
+            local dest=mobPos+away.Unit*math.max(2.5,range-0.2)
+            local floor=findFloorAt(dest,mobModel)
+            if floor then return Vector3.new(dest.X,floor.Y+2.7,dest.Z) end
+            return Vector3.new(dest.X,myPos.Y,dest.Z)
+        end
+    end
     local away=flat(myPos-mobPos)
     if away.Magnitude<0.2 then away=Vector3.new(1,0,0) end
     away=away.Unit
@@ -742,33 +790,59 @@ local function currentHealthFraction(hum)
 end
 local function clearNavigation()
     nav.generation=nav.generation+1
+    nav.pathRequestId=nav.pathRequestId+1
     if nav.blockedConnection then
         pcall(function()nav.blockedConnection:Disconnect()end)
     end
     nav.blockedConnection=nil
-    nav.subject=nil; nav.mode=nil; nav.waypoints=nil;nav.index=1
+    nav.subject=nil;nav.mode=nil;nav.waypoints=nil;nav.index=1
     nav.goal=nil;nav.wanted=nil;nav.computing=false;nav.lastPlan=0
     nav.lastMoveGoal=nil;nav.lastMoveAt=0
     nav.progressGoal=nil;nav.progressDistance=nil;nav.progressAt=0
     nav.failures=0;nav.retryNow=false;nav.lastFallbackAt=0
-    nav.lastPathError=nil
+    nav.lastPathError=nil;nav.steerGoal=nil;nav.steerHum=nil
+    nav.lastGoalChangedAt=0;nav.lastPathRequestGoal=nil;nav.lastPathRequestAt=0
+    nav.lastBestDist=nil;nav.lastMovedPos=nil;nav.lastMovedAt=0
+    nav.routeUnreachableUntil=0
 end
 
 local function sendMove(humanoid,goal,force)
+    if cfg.walkMethod=="Steering" then
+        nav.steerGoal=goal
+        nav.steerHum=humanoid
+        nav.lastMoveGoal=goal
+        nav.lastMoveAt=os.clock()
+        return
+    end
+    nav.steerGoal=nil;nav.steerHum=nil
     local now=os.clock()
-    -- MoveTo restarts Roblox's movement timer and can interrupt turning when
-    -- spammed. Only send for a meaningfully new waypoint or after 3 seconds.
-    if not force and nav.lastMoveGoal and
-        horizontalDistance(nav.lastMoveGoal,goal)<1.6 and
-        now-nav.lastMoveAt<3.0 then return end
+    if not force and nav.lastMoveGoal
+        and horizontalDistance(nav.lastMoveGoal,goal)<1.3
+        and now-nav.lastMoveAt<4.5 then return end
     nav.lastMoveGoal=goal
     nav.lastMoveAt=now
     humanoid:MoveTo(goal)
 end
 
+-- Continuous steering is optional. In some executors the Roblox PlayerModule
+-- overrides Humanoid:Move(), so the user can switch back to MoveTo.
+remember(RunService.Heartbeat:Connect(function()
+    if closed or (not running and not nav.steerGoal) then return end
+    local hum=nav.steerHum
+    local goal=nav.steerGoal
+    if not goal or not hum or hum.Health<=0 then return end
+    local character=hum.Parent
+    local root=character and character:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+    local delta=flat(goal-root.Position)
+    if delta.Magnitude>1.7 then
+        hum:Move(delta.Unit,false)
+    else
+        hum:Move(Vector3.zero,false)
+    end
+end))
+
 local function stopAtCombat(humanoid,root)
-    -- Only stop ONCE on entering the attack band. V4 stopped and restarted
-    -- every time a moving target flickered across the attack boundary.
     if nav.mode~="combat-hold" then
         clearNavigation()
         nav.mode="combat-hold"
@@ -776,29 +850,38 @@ local function stopAtCombat(humanoid,root)
     end
 end
 
-local function requestPath(start,goal,subject)
+-- All ComputeAsync jobs are asynchronous, bounded in age, and committed only
+-- if still matching the current goal. Keep walking a valid OLD route while
+-- a replacement is computed, rather than freezing in place.
+local function requestPath(start,goal,subject,force)
     local now=os.clock()
-    if nav.computing or (now-nav.lastPlan<1.8 and not nav.retryNow) then return end
-    nav.lastPlan=now;nav.retryNow=false;nav.computing=true
-    nav.wanted=goal
+    if nav.computing then return false end
+    if not force and now-nav.lastPlan<2.6 then return false end
+    if force and now-nav.lastPlan<0.9 then return false end
+    nav.computing=true
+    nav.lastPlan=now
+    nav.lastPathRequestGoal=goal
+    nav.lastPathRequestAt=now
+    nav.pathRequestId=nav.pathRequestId+1
+    local requestId=nav.pathRequestId
     local gen=nav.generation
     task.spawn(function()
         local path,waypoints
         local ok,err=pcall(function()
             path=PathfindingService:CreatePath({
                 AgentRadius=2,AgentHeight=5,AgentCanJump=true,
-                AgentCanClimb=false,WaypointSpacing=4,
+                AgentCanClimb=false,WaypointSpacing=5,
             })
             path:ComputeAsync(start,goal)
             if path.Status==Enum.PathStatus.Success then
                 waypoints=path:GetWaypoints()
             end
         end)
-        if closed or not running or nav.generation~=gen or nav.subject~=subject then
-            return
-        end
+        if closed or nav.generation~=gen or nav.pathRequestId~=requestId
+            or nav.subject~=subject then return end
         nav.computing=false
-        if not nav.wanted or horizontalDistance(nav.wanted,goal)>5 then
+        -- Ignore stale paths; the monster may have moved substantially.
+        if nav.wanted and horizontalDistance(nav.wanted,goal)>9 then
             nav.retryNow=true
             return
         end
@@ -807,38 +890,46 @@ local function requestPath(start,goal,subject)
                 pcall(function()nav.blockedConnection:Disconnect()end)
             end
             nav.waypoints=waypoints;nav.index=2;nav.goal=goal
-            nav.progressGoal=nil;nav.progressDistance=nil
+            nav.progressGoal=nil;nav.progressDistance=nil;nav.progressAt=0
+            nav.failures=math.max(0,nav.failures-1)
             nav.lastPathError=nil
-            nav.blockedConnection=path.Blocked:Connect(function(idx)
-                if nav.generation==gen and idx>=nav.index then
+            nav.blockedConnection=path.Blocked:Connect(function(index)
+                if nav.generation==gen and index>=nav.index then
                     nav.retryNow=true
                 end
             end)
         else
-            nav.waypoints=nil;nav.goal=goal
+            -- A failed replan does not delete a still-usable prior route.
+            if not nav.waypoints then nav.goal=goal end
             nav.lastPathError=ok and (path and tostring(path.Status) or "No route") or tostring(err)
+            nav.failures=nav.failures+1
         end
     end)
+    return true
 end
 
 local function checkRouteProgress(root,waypoint)
     local now=os.clock()
     local remaining=horizontalDistance(root.Position,waypoint)
-    if not nav.progressGoal or horizontalDistance(nav.progressGoal,waypoint)>2.5 then
+    if not nav.progressGoal or horizontalDistance(nav.progressGoal,waypoint)>2 then
         nav.progressGoal=waypoint
         nav.progressDistance=remaining
         nav.progressAt=now
+        nav.lastMovedPos=root.Position
+        nav.lastMovedAt=now
         return false
     end
-    -- Track whether remaining distance is actually decreasing, not just
-    -- whether the avatar is wandering left and right around the same rock.
-    if remaining<nav.progressDistance-0.8 then
+    if remaining<nav.progressDistance-0.9 then
         nav.progressDistance=remaining
         nav.progressAt=now
-        if nav.failures>0 then nav.failures=nav.failures-1 end
+        nav.lastMovedPos=root.Position
+        nav.lastMovedAt=now
+        nav.failures=math.max(0,nav.failures-1)
         return false
     end
-    if now-nav.progressAt>2.15 and remaining>3 then
+    -- Require ACTUAL lack of progress for ~2.8 seconds, not small steering
+    -- corrections or movement by a monster changing the desired goal.
+    if now-nav.progressAt>2.8 and remaining>3.0 then
         nav.progressAt=now
         nav.progressDistance=remaining
         nav.failures=nav.failures+1
@@ -856,40 +947,48 @@ local function navMove(humanoid,root,goal,subject,exclude,mode)
         nav.mode=mode
     end
     local now=os.clock()
-    local remaining=horizontalDistance(root.Position,goal)
-    if remaining<1.5 then
+    if horizontalDistance(root.Position,goal)<1.8 then
         return true,"Arrived"
     end
-    local direct=remaining<28
+    nav.wanted=goal
+    local remaining=horizontalDistance(root.Position,goal)
+    local direct=remaining<42
         and los(root.Position,goal,exclude)
         and groundCorridor(root.Position,goal,exclude)
-    -- Direct walking beats ComputeAsync on short unobstructed stretches.
-    -- Clear old waypoint routes so they cannot pull the avatar backwards.
+
+    -- Only abandon a waypoint route if there's a clear direct corridor; this
+    -- avoids oscillating between PathfindingService and steering each tick.
     if direct then
         if nav.waypoints then
             nav.waypoints=nil;nav.index=1;nav.goal=nil
+            nav.progressGoal=nil
         end
         local stalled=checkRouteProgress(root,goal)
         if stalled then
             humanoid.Jump=true
             if nav.failures>=3 then
-                return false,"Direct route blocked"
+                nav.retryNow=true
+                direct=false
             end
         end
-        sendMove(humanoid,goal,false)
-        return true,"Direct"
+        if direct then
+            sendMove(humanoid,goal,false)
+            return true,"Direct"
+        end
     end
 
-    local needsPlan=(not nav.waypoints) or nav.retryNow
-        or (nav.goal and horizontalDistance(nav.goal,goal)>7)
-    if needsPlan then requestPath(root.Position,goal,subject) end
+    local movingGoal=nav.goal and horizontalDistance(nav.goal,goal)>11
+    local needsPlan=(not nav.waypoints) or nav.retryNow or movingGoal
+    if needsPlan then
+        local issued=requestPath(root.Position,goal,subject,nav.retryNow or movingGoal)
+        if issued then nav.retryNow=false end
+    end
 
-    local nextWaypoint
     if nav.waypoints then
         while nav.index<=#nav.waypoints do
-            local wp=nav.waypoints[nav.index]
-            if horizontalDistance(root.Position,wp.Position)<2.7 and
-                math.abs(root.Position.Y-wp.Position.Y)<7 then
+            local waypoint=nav.waypoints[nav.index]
+            if horizontalDistance(root.Position,waypoint.Position)<3.0
+                and math.abs(root.Position.Y-waypoint.Position.Y)<8 then
                 nav.index=nav.index+1
                 nav.progressGoal=nil
             else
@@ -898,54 +997,56 @@ local function navMove(humanoid,root,goal,subject,exclude,mode)
         end
         local waypoint=nav.waypoints[nav.index]
         if waypoint then
-            nextWaypoint=waypoint.Position
             if waypoint.Action==Enum.PathWaypointAction.Jump then
                 humanoid.Jump=true
             end
-        end
-    end
-    if nextWaypoint then
-        local stuck=checkRouteProgress(root,nextWaypoint)
-        if stuck then
-            humanoid.Jump=true
-            if nav.failures>=4 then
-                return false,"Stuck: re-route failed"
+            local stalled=checkRouteProgress(root,waypoint.Position)
+            if stalled then
+                humanoid.Jump=true
+                if nav.failures>=4 then return false,"Stuck at waypoint" end
+                requestPath(root.Position,goal,subject,true)
             end
+            sendMove(humanoid,waypoint.Position,false)
+            return true,"Waypoint "..tostring(nav.index)
+        else
+            nav.waypoints=nil
         end
-        sendMove(humanoid,nextWaypoint,false)
-        return true,"Waypoint "..tostring(nav.index)
     end
 
     if nav.computing then
-        -- Discard an unusually slow ComputeAsync to avoid a permanent freeze.
-        if now-nav.lastPlan>5.0 then
-            nav.generation=nav.generation+1
+        -- Avoid a dead state if a path computation hangs.
+        if now-nav.lastPathRequestAt>5 then
+            nav.pathRequestId=nav.pathRequestId+1
             nav.computing=false
-            nav.retryNow=true
+            nav.lastPathError="Path planning timed out"
+            nav.failures=nav.failures+1
         else
-            return true,"Planning route"
+            -- One steady short direct move while computing (only if clear).
+            if not nav.lastMoveGoal or horizontalDistance(root.Position,nav.lastMoveGoal)<2.0 then
+                local step=safeShortStep(root.Position,goal,exclude)
+                if step then sendMove(humanoid,step,false) end
+            end
+            return true,"Planning"
         end
     end
-    if nav.lastMoveGoal and horizontalDistance(root.Position,nav.lastMoveGoal)>2.5 then
+
+    -- Do not pick a new fallback side step every tick: give it time to finish.
+    if nav.lastMoveGoal and now-nav.lastFallbackAt<2.4
+        and horizontalDistance(root.Position,nav.lastMoveGoal)>1.8 then
         local stalled=checkRouteProgress(root,nav.lastMoveGoal)
-        if stalled then humanoid.Jump=true end
+        if not stalled then return true,"Detour" end
     end
-    if nav.failures>=4 then return false,"No traversable path" end
-    -- Do not start a new sidestep every 0.17 seconds; keep each attempt long
-    -- enough to reach the selected ground point before replanning it.
-    if now-nav.lastFallbackAt>=2.8 then
+    if nav.failures>=5 then return false,"No traversable route" end
+    if now-nav.lastFallbackAt>2.4 then
         nav.lastFallbackAt=now
         local step=safeShortStep(root.Position,goal,exclude)
-        if step and horizontalDistance(root.Position,step)>1.7 then
-            -- Keep previous progress checkpoint if repeating the same step.
-            if not nav.progressGoal or horizontalDistance(nav.progressGoal,step)>2.5 then
-                nav.progressGoal=nil
-            end
+        if step and horizontalDistance(root.Position,step)>1.6 then
+            nav.progressGoal=nil
             sendMove(humanoid,step,false)
-            return true,"Grounded detour"
+            return true,"Detour"
         end
     end
-    return true,"Waiting for route"
+    return true,"Searching safe route"
 end
 
 -- ---------------- Teleporter return support ----------------
@@ -953,7 +1054,20 @@ local function portalObjectName(inst)
     local parentName=inst.Parent and inst.Parent.Name or ""
     local generic=parentName:lower()
     if generic=="portals" or generic=="teleporters" or generic=="teleports" then parentName="" end
-    return (inst.Name.." "..parentName):lower()
+    local title=(inst.Name.." "..parentName):lower()
+    -- Don't traverse deep world/terrain Models while scanning every BasePart.
+    -- Only check nested prompts for plausible teleporter object names.
+    local candidate=title:find("portal",1,true) or title:find("teleport",1,true)
+        or title:find("gateway",1,true) or title:find("ruins",1,true)
+        or title:find("slime",1,true) or title:find("hub",1,true)
+    local prompt=inst:FindFirstChildOfClass("ProximityPrompt")
+    if not prompt and candidate then
+        prompt=inst:FindFirstChildWhichIsA("ProximityPrompt",true)
+    end
+    if prompt then
+        title=title.." "..prompt.ActionText:lower().." "..prompt.ObjectText:lower()
+    end
+    return title
 end
 local function looksLikePortal(inst)
     if not (inst:IsA("Model") or inst:IsA("BasePart")) then return false end
@@ -961,6 +1075,7 @@ local function looksLikePortal(inst)
     local text=portalObjectName(inst)
     return text:find("portal",1,true)~=nil or text:find("teleport",1,true)~=nil
         or text:find("gateway",1,true)~=nil
+        or text:find("travel to",1,true)~=nil
 end
 local function portalPart(obj)
     if obj:IsA("BasePart") then return obj end
@@ -992,28 +1107,30 @@ local function scanPortals()
     lastPortalScan=os.clock()
     return found
 end
-local function assignedPortalName()
-    return cfg.targetGroup=="Slime" and cfg.portalSlimeName or cfg.portalSkeletonName
+local function assignedPortalName(destination)
+    destination=destination or cfg.targetGroup
+    return destination=="Slime" and cfg.portalSlimeName or cfg.portalSkeletonName
 end
-local function matchingDestination(portal)
-    local n=portalObjectName(portal.object)
+local function matchingDestination(portal,destination)
+    destination=destination or cfg.targetGroup
+    local name=portalObjectName(portal.object)
     local full=portal.object:GetFullName()
-    local assigned=assignedPortalName()
+    local assigned=assignedPortalName(destination)
     if assigned~="" then
         if assigned==full then return 100 end
         if assigned==portal.object.Name then return 90 end
-        return 0
     end
-    if cfg.targetGroup=="Slime" then
-        if n:find("slime",1,true) or n:find("wildland",1,true) then return 60 end
+    if destination=="Slime" then
+        if name:find("slime",1,true) or name:find("wildland",1,true) then return 60 end
     else
-        if n:find("ruins",1,true) or n:find("skeleton",1,true) then return 60 end
+        if name:find("ruins",1,true) or name:find("skeleton",1,true) then return 60 end
     end
     return 0
 end
-local function findReturnPortal(root)
+local function findReturnPortal(root,destination,avoidObject,avoidUntil)
+    destination=destination or cfg.targetGroup
     local best,bestScore=nil,-math.huge
-    local assigned=assignedPortalName()
+    local assigned=assignedPortalName(destination)
     local baseName=assigned~="" and assigned:match("[^%.]+$") or nil
     local sameNamed=0
     if baseName then
@@ -1021,23 +1138,25 @@ local function findReturnPortal(root)
             if candidate.object.Name==baseName then sameNamed=sameNamed+1 end
         end
     end
+    local now=os.clock()
     for _,item in ipairs(portals) do
-        if item.part.Parent then
-            local score=matchingDestination(item)
+        if item.part.Parent and (item.object~=avoidObject or now>=(avoidUntil or 0)) then
+            local score=matchingDestination(item,destination)
             if score==0 and sameNamed==1 and item.object.Name==baseName then
-                score=80 -- account-specific full path changed; unique name survives
+                score=80
             end
             if score>0 then
                 local dist=(item.part.Position-root.Position).Magnitude
-                if dist<=350 and score*10-dist>bestScore then
+                -- A destination portal that is visible and close is preferred
+                -- over travelling back through a Home/Hub portal.
+                if dist<=450 and score*10-dist>bestScore then
                     best,bestScore=item,score*10-dist
                 end
             end
         end
     end
-    if best then return best end
-    -- Multi-hop recovery: Home island -> Hub, then Hub -> Slime/Ruins.
-    -- Hub step is NEVER guessed; must be explicitly bound by user.
+    if best then return best,"destination" end
+    -- Home -> Hub as an explicit optional first hop. Never guess a random portal.
     if cfg.portalHubName~="" then
         local hubBaseName=cfg.portalHubName:match("[^%.]+$")
         local hubMatches=0
@@ -1050,14 +1169,16 @@ local function findReturnPortal(root)
             local matches=full==cfg.portalHubName
                 or (hubMatches==1 and item.object.Name==hubBaseName)
             local dist=(item.part.Position-root.Position).Magnitude
-            if matches and dist<350 and dist<hubDistance then
+            if matches and dist<450 and dist<hubDistance
+                and (item.object~=avoidObject or now>=(avoidUntil or 0)) then
                 hubBest,hubDistance=item,dist
             end
         end
-        return hubBest
+        if hubBest then return hubBest,"hub" end
     end
-    return nil
+    return nil,"unknown"
 end
+
 local function bindNearestPortal(group)
     local _,_,root=getCharacter()
     if not root then setStatus("Stand near a teleporter first") return end
@@ -1108,6 +1229,165 @@ local function triggerPortal(item)
     if ok then setStatus("Using portal prompt: "..item.object.Name) end
 end
 
+local function cancelManualTravel(message)
+    if not manualTravel.active then return end
+    manualTravel.active=false
+    manualTravel.portal=nil
+    manualTravel.enteredAt=0
+    manualTravel.enteredPos=nil
+    clearNavigation()
+    local _,hum,root=getCharacter()
+    if hum and root then hum:MoveTo(root.Position) end
+    setStatus(message or "Teleport request cancelled")
+end
+
+local function requestManualTravel(destination)
+    if destination~="Slime" and destination~="Ruins" then return end
+    if running then
+        -- run the same cleanup as Stop Hunt, without depending on a GUI button
+        running=false
+        currentTarget=nil
+        activePortal=nil
+        clearNavigation()
+        if farmButton and farmButton.Parent then farmButton.Text="START AUTO HUNT" end
+    end
+    manualTravel.active=true
+    manualTravel.destination=destination
+    manualTravel.started=os.clock()
+    manualTravel.portal=nil
+    manualTravel.enteredAt=0
+    manualTravel.enteredPos=nil
+    manualTravel.avoidObject=nil
+    manualTravel.avoidUntil=0
+    manualTravel.lastTransition=0
+    manualTravel.lastScan=0
+    manualTravel.directDestination=false
+    manualTravel.lastArrivalCheck=0
+    scanPortals()
+    setStatus("Teleport "..destination..": locating in-game portal")
+end
+
+local function atTravelDestination(root,destination)
+    -- Known live mobs near the avatar indicate we're in the right hunting area.
+    -- This avoids endlessly re-entering a portal after arrival.
+    local category=destination=="Ruins" and "Skeleton" or "Slime"
+    for _,mob in ipairs(npcCache) do
+        if categoryOf(mob)==category and isMonster(mob) then
+            local part=findRoot(mob)
+            if part and horizontalDistance(root.Position,part.Position)<75
+                and math.abs(root.Position.Y-part.Position.Y)<24 then return true end
+        end
+    end
+    return false
+end
+
+local function runManualTravel(hum,root,now)
+    if not manualTravel.active then return end
+    local destination=manualTravel.destination
+    if now-manualTravel.started>135 then
+        cancelManualTravel("Teleport timed out. Bind SLIME / RUINS portal and retry")
+        return
+    end
+    if now-manualTravel.lastScan>6 then
+        manualTravel.lastScan=now
+        scanPortals()
+    end
+    if now-manualTravel.lastTransition>2 and now-manualTravel.lastArrivalCheck>1.1 then
+        manualTravel.lastArrivalCheck=now
+        if atTravelDestination(root,destination) then
+            cancelManualTravel("Arrived at "..destination.." area (visible mobs nearby)")
+            return
+        end
+    end
+    -- Observe the actual server-controlled position change before treating
+    -- a portal as successful. Re-scan afterward in case Home -> Hub is required.
+    if manualTravel.enteredPos then
+        local displacement=(root.Position-manualTravel.enteredPos).Magnitude
+        if displacement>32 then
+            local used=manualTravel.portal
+            manualTravel.avoidObject=used
+            manualTravel.avoidUntil=now+23
+            local arrived=manualTravel.directDestination
+            manualTravel.portal=nil
+            manualTravel.enteredPos=nil
+            manualTravel.enteredAt=0
+            manualTravel.lastTransition=now
+            clearNavigation()
+            scanPortals()
+            if arrived then
+                cancelManualTravel("Portal moved player; check "..destination.." area")
+                return
+            end
+            setStatus("Hub step complete; searching "..destination.." portal")
+            return
+        end
+        if now-manualTravel.enteredAt>14 then
+            -- No position change; maybe wrong bind or UI-based teleport.
+            manualTravel.avoidObject=manualTravel.portal
+            manualTravel.avoidUntil=now+12
+            manualTravel.portal=nil
+            manualTravel.enteredPos=nil
+            manualTravel.enteredAt=0
+            clearNavigation()
+            setStatus("Portal didn't transfer. Check its prompt / unlock")
+            return
+        end
+    end
+    local portal,step
+    if manualTravel.enteredPos and manualTravel.portal
+        and manualTravel.portal:IsDescendantOf(Workspace) then
+        -- Keep the same portal while an activation is pending, but CONTINUE
+        -- sending walking/interaction input if it requires touching the portal.
+        for _,candidate in ipairs(portals) do
+            if candidate.object==manualTravel.portal then portal=candidate break end
+        end
+        if not portal then
+            local part=portalPart(manualTravel.portal)
+            if part then portal={object=manualTravel.portal,part=part} end
+        end
+        step=manualTravel.directDestination and "destination" or "hub"
+    end
+    if not portal then
+        portal,step=findReturnPortal(root,destination,manualTravel.avoidObject,manualTravel.avoidUntil)
+    end
+    if not portal then
+        targetText.Text="Teleport "..destination.." | portal not detected"
+        setStatus("No portal for "..destination..". Use BIND near portal, then retry")
+        return
+    end
+    if manualTravel.portal~=portal.object then
+        manualTravel.portal=portal.object
+        manualTravel.enteredAt=0
+        manualTravel.enteredPos=nil
+        manualTravel.directDestination=(step=="destination")
+        clearNavigation()
+    end
+    local portalPos=portal.part.Position
+    local distance=(root.Position-portalPos).Magnitude
+    targetText.Text=string.format("Teleport %s via %s (%.0f st)",destination,portal.object.Name,distance)
+    if distance<=9 then
+        if not manualTravel.enteredPos then
+            manualTravel.enteredPos=root.Position
+            manualTravel.enteredAt=now
+        end
+        triggerPortal(portal)
+        if distance>2.5 then
+            sendMove(hum,portalPos,false)
+        end
+        setStatus("Using "..portal.object.Name.." ["..step.."]")
+    else
+        local ok,info=navMove(hum,root,portalPos,portal.object,portal.object,"manual-portal")
+        if not ok then
+            manualTravel.avoidObject=portal.object
+            manualTravel.avoidUntil=now+8
+            clearNavigation()
+            setStatus("Portal route blocked: trying another bound portal")
+        else
+            setStatus("Walking to "..destination.." portal ["..info.."]")
+        end
+    end
+end
+
 local function stopHunt()
     running=false
     currentTarget=nil
@@ -1123,6 +1403,7 @@ local function stopHunt()
 end
 local function shutdown()
     if closed then return end
+    if manualTravel.active then cancelManualTravel("Closing RHYE Hub") end
     stopHunt()
     if cfg.autoSave then writeConfig(true) end
     closed=true
@@ -1180,7 +1461,7 @@ local function button(parent,text,size)
 end
 
 gui = create("ScreenGui",{
-    Name="RHYE_ABOVE_AutoHunt_V5", ResetOnSpawn=false, IgnoreGuiInset=true,
+    Name="RHYE_ABOVE_AutoHunt_V6", ResetOnSpawn=false, IgnoreGuiInset=true,
     ZIndexBehavior=Enum.ZIndexBehavior.Sibling, DisplayOrder=10020,
 },player:WaitForChild("PlayerGui"))
 local main = create("Frame",{
@@ -1228,7 +1509,7 @@ hideNav.Position=UDim2.new(0,10,1,-52)
 local header=label(main,"RHYE Hub  /  Combat",18,true)
 header.Position=UDim2.fromOffset(93,19)
 header.Size=UDim2.fromOffset(370,25)
-local subtitle=label(main,"ABOVE · Smooth Navigation + Nearest Target V5",11,false,colors.muted)
+local subtitle=label(main,"ABOVE · Smooth Walk + Slime / Ruins Teleport V6",11,false,colors.muted)
 subtitle.Position=UDim2.fromOffset(94,45)
 subtitle.Size=UDim2.fromOffset(370,20)
 local close=button(main,"×",24)
@@ -1256,7 +1537,7 @@ local infoFrame=create("Frame",{
 local infoLabel=label(infoFrame,"RHYE HUB  ·  ABOVE",23,true,colors.green)
 infoLabel.Size=UDim2.new(1,0,0,40)
 local infoBody=label(infoFrame,
-    "AUTO HUNT V5 · STABLE CHASE + SMART WAYPOINTS\n\n1. Target: Slime (all kinds) OR Skeleton (all kinds).\n2. Use APPLY SWORD PRESET for recommended starting values.\n3. Search Radius finds NPCs; Attack Range controls hits.\n4. Nearest mob priority with short target lock.\n5. Navigation will repath only on obstruction/stall.\n6. If home-return fails, bind HOME->HUB portal at Home,\n   then bind SLIME/RUINS portal at the Hub (if needed).\n7. All accounts using the same Potassium workspace share\n   RHYE_Hub/ABOVE_Global_Config.json.\n\nNo guaranteed invulnerability; monster AI and server rules\nmay still deal damage. Anti-AFK success depends on executor.",
+    "AUTO HUNT V6 · STEADY WALK + PORTAL TRAVEL\n\n1. Targets: Slime (all kinds) or Skeleton (all kinds).\n2. MoveTo is the default; try Steering if character stalls.\n3. Stable waypoints, repath only on genuine failure.\n4. TELEPORT supports Slime and Ruins through game portals.\n5. Stand near a portal and BIND if it is not recognized.\n6. HOME -> HUB may be required for multiple hops.\n7. Ruins may require legitimate unlock progress.\n8. Settings are shared in Potassium workspace:\n   RHYE_Hub/ABOVE_Global_Config.json.\n\nClient-side walking and portal prompts depend on server rules.\nTeleport is not an instant server bypass; Anti-AFK not guaranteed.",
     13,false,colors.muted)
 infoBody.Size=UDim2.new(1,-18,1,-60)
 infoBody.Position=UDim2.fromOffset(0,50)
@@ -1421,6 +1702,7 @@ sliderRow("Low HP Threshold","Start defensive retreat under this percent HP.","l
 sliderRow("Attack Interval","Added delay, does not bypass game cooldown.","attackInterval",0.15,2,0.05," s")
 sliderRow("Search Radius","Mob detection ONLY (separate from Attack Range). Requires client streaming.","maxSearch",60,600,10," st")
 sliderRow("Walk Speed","Client Humanoid speed while hunting; may be limited.","walkSpeed",12,32,1,"")
+cycleRow("Walk Method","MoveTo = stable default; Steering = continuous walking (experimental).","walkMethod",{"MoveTo","Steering"})
 cycleRow("Attack Method","Mouse = game LMB; Tool = Tool:Activate().","attackMode",{"Mouse","Tool","Auto"})
 toggleRow("Auto Chase","Smooth stable waypoints + replan on obstruction only.","autoChase")
 toggleRow("Auto Equip","Try equipping a matching Roblox Tool.","autoEquip")
@@ -1452,7 +1734,7 @@ remember(mobScanBtn.MouseButton1Click:Connect(function()
         local _,_,root=getCharacter()
         if root then
             lastNearScan=0
-            scanNearbyNPCs(root)
+            scanNearbyNPCs(root,true)
         end
         local count=0
         print("[RHYE ABOVE MOBS] --- scan --- total cached: "..tostring(#npcCache))
@@ -1505,6 +1787,22 @@ remember(portalScanButton.MouseButton1Click:Connect(function()
     setStatus("Portal scan: "..#portals.." candidates (F9 output)")
 end))
 
+section("TELEPORT • SLIME / RUINS")
+cycleRow("Teleport Destination","Choose Slime area or Ruins; follows available in-game portal.","teleportDestination",{"Slime","Ruins"})
+local tpRow=settingRow("Teleport via Portal","GO follows real game portal; no instant server teleport.",95)
+local tpGo=button(tpRow,"GO TO SELECTED",11)
+tpGo.Size=UDim2.fromOffset(170,32)
+tpGo.Position=UDim2.fromOffset(14,54)
+local tpCancel=button(tpRow,"CANCEL TELEPORT",11)
+tpCancel.Size=UDim2.fromOffset(170,32)
+tpCancel.Position=UDim2.fromOffset(196,54)
+remember(tpGo.MouseButton1Click:Connect(function()
+    requestManualTravel(cfg.teleportDestination)
+end))
+remember(tpCancel.MouseButton1Click:Connect(function()
+    cancelManualTravel("Teleport cancelled")
+end))
+
 section("PERSISTENCE & IDLE")
 toggleRow("Anti AFK","ON by default; sends idle-input pulse (executor dependent).","autoAfk")
 toggleRow("Auto Save Config","Automatically save every changed setting to workspace.","autoSave")
@@ -1531,6 +1829,7 @@ farmButton.Size=UDim2.fromOffset(149,34)
 farmButton.Position=UDim2.new(1,-151,0,13)
 local function startHunt()
     if running then return end
+    if manualTravel.active then cancelManualTravel("Teleport cancelled; starting farm") end
     if not cfg.farmMobs then setStatus("Enable Farm Mobs first") return end
     running=true
     currentTarget=nil
@@ -1541,7 +1840,7 @@ local function startHunt()
     nextAttack=0
     clearNavigation()
     farmButton.Text="STOP AUTO HUNT"
-    setStatus("Auto Hunt V5 started: "..cfg.targetGroup)
+    setStatus("Auto Hunt V6 started: "..cfg.targetGroup)
 end
 remember(farmButton.MouseButton1Click:Connect(function()
     if running then stopHunt() else startHunt() end
@@ -1660,7 +1959,7 @@ task.spawn(function()
                 end
             end)
         end
-        if cfg.autoReturn and os.clock()-lastPortalScan>10 then pcall(scanPortals) end
+        if (cfg.autoReturn or manualTravel.active) and os.clock()-lastPortalScan>10 then pcall(scanPortals) end
     end
 end)
 
@@ -1671,7 +1970,7 @@ local lastPortalFailureAt=0
 task.spawn(function()
     while not closed do
         task.wait(0.17)
-        if not running then continue end
+        if not running and not manualTravel.active then continue end
         local character,hum,root=getCharacter()
         if not character then
             setStatus("Waiting for character / respawn")
@@ -1686,6 +1985,10 @@ task.spawn(function()
             lastMovementSpeedSet=now
         end
         scanNearbyNPCs(root)
+        if manualTravel.active then
+            runManualTravel(hum,root,now)
+            continue
+        end
         if now-lastHealthCheck>0.65 then
             lastHealthCheck=now
             local ratio,absolute=currentHealthFraction(hum)
@@ -1803,10 +2106,10 @@ task.spawn(function()
             elseif cfg.autoChase then
                 lastRetreatGoal=nil
                 if lastApproachTarget~=target or not approachCache
-                    or now-approachAt>4.0
-                    or (mobCachePos and horizontalDistance(part.Position,mobCachePos)>5)
-                    or (horizontalDistance(root.Position,approachCache)<2.5 and not inRange)
-                    or nav.failures>=2 then
+                    or now-approachAt>7.0
+                    or (mobCachePos and horizontalDistance(part.Position,mobCachePos)>8)
+                    or (horizontalDistance(root.Position,approachCache)<2.1 and not inRange)
+                    or nav.failures>=3 then
                     approachCache=approachPoint(root.Position,part,target,idealGap)
                     approachAt=now
                     lastApproachTarget=target
@@ -1901,5 +2204,5 @@ end)
 
 setStatus(loadedConfig and "Loaded shared config | "..cfg.targetGroup.." | Anti-AFK "..(cfg.autoAfk and "ON" or "OFF")
     or "Ready | Shared config | Anti-AFK ON")
-print("[RHYE ABOVE] V5 Smooth Navigation loaded. Shared config: "..CONFIG_FILE)
+print("[RHYE ABOVE] V6 Improved Walking + Portal Teleport loaded. Shared config: "..CONFIG_FILE)
 print("[RHYE ABOVE] Group: "..cfg.targetGroup.."  AutoReturn: "..tostring(cfg.autoReturn).."  AutoAFK: "..tostring(cfg.autoAfk))
