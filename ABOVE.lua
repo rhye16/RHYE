@@ -1,10 +1,12 @@
 --[[
- RHYE Hub | ABOVE Auto Hunt V7.0 — Stable Chase + Smart Unstuck + No-Damage Switch
+ RHYE Hub | ABOVE Auto Hunt V8.0 — Post-Control Movement Fix + Navigation Telemetry
  PlaceId: 124357835578554
 
  Community client-side helper. Uses visible NPC models, PathfindingService,
  standard Tool / mouse input, and detectable in-world teleporter interactions.
  No arbitrary server RemoteEvent calls, no damage overrides, no noclip.
+ V8 uses post-ControlModule Humanoid:Move while navigating, instead of relying
+ exclusively on MoveTo (which may be overridden by in-game client controls).
  Local combat spacing and low-HP safety are best effort, not immunity.
 
  Configuration: RHYE_Hub/ABOVE_Global_Config.json (executor workspace)
@@ -56,7 +58,8 @@ local defaults = {
     attackInterval = 0.50,
     maxSearch = 300, -- target acquisition radius, independent of attack distance
     walkSpeed = 20,
-    walkMethod = "MoveTo", -- MoveTo is safest; Steering is optional continuous local movement
+    walkMethod = "Hybrid", -- V8 default: post-control directional driving + stable MoveTo/path goals
+    navEngineVersion = 8, -- one-time migration for previously saved V7 configs
     teleportDestination = "Slime", -- manual portal travel: Slime or Ruins
     autoChase = true,
     autoEquip = true,
@@ -115,7 +118,12 @@ cfg.stuckTimeout = math.clamp(cfg.stuckTimeout,1.8,8)
 cfg.noDamageTimeout = math.clamp(cfg.noDamageTimeout,6,30)
 cfg.skipCooldown = math.clamp(cfg.skipCooldown,8,60)
 if not table.find({"Off","Ranged Only","All Weapons"},cfg.spacingMode) then cfg.spacingMode="Ranged Only" end
-if cfg.walkMethod~="MoveTo" and cfg.walkMethod~="Steering" then cfg.walkMethod="MoveTo" end
+-- Existing users may have V7's MoveTo mode saved; upgrade it once to Hybrid.
+-- Keep other saved settings, including Auto Return / anti-AFK / shared paths.
+local navConfigUpgrade = previous and (tonumber(previous.navEngineVersion) or 0)<8
+if navConfigUpgrade and cfg.walkMethod=="MoveTo" then cfg.walkMethod="Hybrid" end
+if not table.find({"Hybrid","MoveTo","Steering"},cfg.walkMethod) then cfg.walkMethod="Hybrid" end
+cfg.navEngineVersion=8
 if cfg.teleportDestination~="Slime" and cfg.teleportDestination~="Ruins" then cfg.teleportDestination="Slime" end
 
 local running, closed = false, false
@@ -153,6 +161,8 @@ local nav = {
     lastRouteWarningAt=0, lastPathError=nil,
     lastGoalChangedAt=0, lastPathRequestGoal=nil, lastPathRequestAt=0,
     steerGoal=nil, steerHum=nil, lastBestDist=nil, lastMovedPos=nil,
+    actualSpeed=0, driveSamples=0, driveLastPos=nil, driveLastAt=0,
+    driveCommanded=false, driveMode="idle", driveBindName="RHYE_ABOVE_V8_PostControls",
     lastMovedAt=0, pathRequestId=0, routeUnreachableUntil=0,
 }
 local blocked = setmetatable({},{__mode="k"})
@@ -540,7 +550,7 @@ local function chooseTarget(root)
                 local height=math.abs(delta.Y)
                 if dist<=cfg.maxSearch and height<=35 then
                     local skipped=blocked[npc] and blocked[npc]>now
-                    if not skipped or dist<=cfg.attackRange+1.5 then
+                    if not skipped then
                         if dist<bestDist then best,bestDist=npc,dist end
                     end
                     if npc==currentTarget then currentDist=dist end
@@ -859,43 +869,97 @@ local function clearNavigation()
     nav.lastGoalChangedAt=0;nav.lastPathRequestGoal=nil;nav.lastPathRequestAt=0
     nav.lastBestDist=nil;nav.lastMovedPos=nil;nav.lastMovedAt=0
     nav.routeUnreachableUntil=0
+    nav.driveCommanded=false; nav.driveMode="idle"
+    nav.driveLastPos=nil;nav.driveLastAt=0;nav.actualSpeed=0
 end
 
+-- Two separate responsibilities:
+-- 1) navigation/path planner determines ONE stable waypoint.
+-- 2) a post-ControlModule driver applies the requested direction every frame.
+-- Many Roblox games write Humanoid:Move(Vector3.zero) from their PlayerModule
+-- after a one-shot MoveTo; when that happens MoveTo reports a goal but the
+-- avatar stands still in OPEN terrain (exactly what the V7 recording shows).
 local function sendMove(humanoid,goal,force)
-    if cfg.walkMethod=="Steering" then
+    if cfg.walkMethod=="Hybrid" or cfg.walkMethod=="Steering" then
         nav.steerGoal=goal
         nav.steerHum=humanoid
+        local now=os.clock()
+        local mustUpdate=force or not nav.lastMoveGoal
+            or horizontalDistance(nav.lastMoveGoal,goal)>1.3
+            or now-nav.lastMoveAt>3.4
         nav.lastMoveGoal=goal
-        nav.lastMoveAt=os.clock()
+        if mustUpdate then
+            nav.lastMoveAt=now
+            if cfg.walkMethod=="Hybrid" then
+                -- Useful for state replication and as a fallback, but NOT the
+                -- only source of motion while pursuing a target.
+                humanoid:MoveTo(goal)
+            end
+        end
         return
     end
     nav.steerGoal=nil;nav.steerHum=nil
     local now=os.clock()
     if not force and nav.lastMoveGoal
         and horizontalDistance(nav.lastMoveGoal,goal)<1.3
-        and now-nav.lastMoveAt<4.5 then return end
+        and now-nav.lastMoveAt<3.4 then return end
     nav.lastMoveGoal=goal
     nav.lastMoveAt=now
     humanoid:MoveTo(goal)
 end
 
--- Continuous steering is optional. In some executors the Roblox PlayerModule
--- overrides Humanoid:Move(), so the user can switch back to MoveTo.
-remember(RunService.Heartbeat:Connect(function()
-    if closed or (not running and not nav.steerGoal) then return end
+nav.driveAfterControls=function()
+    if closed or (not running and not manualTravel.active) then return end
     local hum=nav.steerHum
     local goal=nav.steerGoal
     if not goal or not hum or hum.Health<=0 then return end
     local character=hum.Parent
     local root=character and character:FindFirstChild("HumanoidRootPart")
-    if not root then return end
+    if not root or root.Anchored then
+        nav.driveMode=root and "root anchored" or "root missing"
+        return
+    end
+    local now=os.clock()
+    if nav.driveLastPos and now-nav.driveLastAt>0.6 then
+        local elapsed=math.max(0.1,now-nav.driveLastAt)
+        nav.actualSpeed=horizontalDistance(root.Position,nav.driveLastPos)/elapsed
+        nav.driveLastPos=root.Position
+        nav.driveLastAt=now
+    elseif not nav.driveLastPos then
+        nav.driveLastPos=root.Position
+        nav.driveLastAt=now
+    end
     local delta=flat(goal-root.Position)
-    if delta.Magnitude>1.7 then
+    if delta.Magnitude>1.6 then
+        -- World-space direction. Executed AFTER Roblox's ControlModule render
+        -- step, preventing zero movement input from cancelling our nav command.
         hum:Move(delta.Unit,false)
+        nav.driveCommanded=true
+        nav.driveSamples=nav.driveSamples+1
+        nav.driveMode=cfg.walkMethod
     else
         hum:Move(Vector3.zero,false)
+        nav.driveCommanded=false
+        nav.driveMode="at waypoint"
     end
-end))
+end
+
+-- Character priority is later than the usual Input / ControlModule step.
+-- A named render binding is unbound in shutdown, so script reloads do not
+-- accumulate independent movement writers in the same client.
+nav.movementBound=false
+nav.bindOK,nav.bindError=pcall(function()
+    RunService:BindToRenderStep(nav.driveBindName,
+        Enum.RenderPriority.Character.Value+5,nav.driveAfterControls)
+end)
+if nav.bindOK then
+    nav.movementBound=true
+else
+    -- Fallback if an executor denies BindToRenderStep. This may be less
+    -- reliable than post-input movement in games with custom controls.
+    warn("[RHYE ABOVE V8] Post-input movement unavailable: "..tostring(nav.bindError))
+    remember(RunService.Heartbeat:Connect(nav.driveAfterControls))
+end
 
 local function stopAtCombat(humanoid,root)
     if nav.mode~="combat-hold" then
@@ -1527,7 +1591,7 @@ local function stopHunt()
     kiteActive=false;kiteTarget=nil;kiteUntil=0
     clearNavigation()
     local _,hum,root=getCharacter()
-    if hum and root then hum:MoveTo(root.Position) end
+    if hum and root then hum:MoveTo(root.Position);hum:Move(Vector3.zero,false) end
     if farmButton and farmButton.Parent then farmButton.Text="START AUTO HUNT" end
     setStatus("Auto Hunt stopped")
 end
@@ -1537,6 +1601,10 @@ local function shutdown()
     stopHunt()
     if cfg.autoSave then writeConfig(true) end
     closed=true
+    if nav.movementBound then
+        pcall(function()RunService:UnbindFromRenderStep(nav.driveBindName)end)
+        nav.movementBound=false
+    end
     for _,conn in ipairs(connections) do pcall(function()conn:Disconnect()end)end
     if gui then pcall(function()gui:Destroy()end)end
 end
@@ -1591,7 +1659,7 @@ local function button(parent,text,size)
 end
 
 gui = create("ScreenGui",{
-    Name="RHYE_ABOVE_AutoHunt_V7", ResetOnSpawn=false, IgnoreGuiInset=true,
+    Name="RHYE_ABOVE_AutoHunt_V8", ResetOnSpawn=false, IgnoreGuiInset=true,
     ZIndexBehavior=Enum.ZIndexBehavior.Sibling, DisplayOrder=10020,
 },player:WaitForChild("PlayerGui"))
 local main = create("Frame",{
@@ -1639,7 +1707,7 @@ hideNav.Position=UDim2.new(0,10,1,-52)
 local header=label(main,"RHYE Hub  /  Combat",18,true)
 header.Position=UDim2.fromOffset(93,19)
 header.Size=UDim2.fromOffset(370,25)
-local subtitle=label(main,"ABOVE · Stable Chase + Auto Fix Stuck V7",11,false,colors.muted)
+local subtitle=label(main,"ABOVE · Post-Control Movement + Navigation V8",11,false,colors.muted)
 subtitle.Position=UDim2.fromOffset(94,45)
 subtitle.Size=UDim2.fromOffset(370,20)
 local close=button(main,"×",24)
@@ -1667,7 +1735,7 @@ local infoFrame=create("Frame",{
 local infoLabel=label(infoFrame,"RHYE HUB  ·  ABOVE",23,true,colors.green)
 infoLabel.Size=UDim2.new(1,0,0,40)
 local infoBody=label(infoFrame,
-    "AUTO HUNT V7 · ANTI-STUCK + 10S NO-DAMAGE SWITCH\n\n1. Targets: Slime (all kinds) or Skeleton (all kinds).\n2. Sword spacing is disabled by default to stop chase/retreat loops.\n3. Auto Fix Stuck watches real movement; 10s no-damage switch uses observed mob HP when available.\n4. TELEPORT supports Slime and Ruins through game portals.\n5. Stand near a portal and BIND if it is not recognized.\n6. HOME -> HUB may be required for multiple hops.\n7. Ruins may require legitimate unlock progress.\n8. Settings are shared in Potassium workspace:\n   RHYE_Hub/ABOVE_Global_Config.json.\n\nClient-side walking and portal prompts depend on server rules.\nTeleport is not an instant server bypass; Anti-AFK not guaranteed.",
+    "AUTO HUNT V8 · POST-CONTROL MOVEMENT + ANTI-STUCK\n\n1. Targets: Slime (all kinds) or Skeleton (all kinds).\n2. Sword spacing is disabled by default to stop chase/retreat loops.\n3. Auto Fix Stuck watches real movement; 10s no-damage switch uses observed mob HP when available.\n4. TELEPORT supports Slime and Ruins through game portals.\n5. Stand near a portal and BIND if it is not recognized.\n6. HOME -> HUB may be required for multiple hops.\n7. Ruins may require legitimate unlock progress.\n8. Settings are shared in Potassium workspace:\n   RHYE_Hub/ABOVE_Global_Config.json.\n\nClient-side walking and portal prompts depend on server rules.\nTeleport is not an instant server bypass; Anti-AFK not guaranteed.",
     13,false,colors.muted)
 infoBody.Size=UDim2.new(1,-18,1,-60)
 infoBody.Position=UDim2.fromOffset(0,50)
@@ -1834,7 +1902,7 @@ sliderRow("Low HP Threshold","Start defensive retreat under this percent HP.","l
 sliderRow("Attack Interval","Added delay, does not bypass game cooldown.","attackInterval",0.15,2,0.05," s")
 sliderRow("Search Radius","Mob detection ONLY (separate from Attack Range). Requires client streaming.","maxSearch",60,600,10," st")
 sliderRow("Walk Speed","Client Humanoid speed while hunting; may be limited.","walkSpeed",12,32,1,"")
-cycleRow("Walk Method","MoveTo is recommended; Steering is experimental.","walkMethod",{"MoveTo","Steering"})
+cycleRow("Walk Method","Hybrid drives after Roblox controls (recommended); MoveTo is legacy.","walkMethod",{"Hybrid","MoveTo","Steering"})
 section("STUCK RECOVERY & FAILED TARGETS")
 toggleRow("Auto Fix Stuck","Jump, replan, then skip blocked mob if still stuck.","autoFixStuck")
 sliderRow("Stuck Timeout","Seconds without progress toward waypoint before recovery.","stuckTimeout",2,8,0.5," s")
@@ -1848,7 +1916,7 @@ debugCombatButton.Position=UDim2.new(1,-161,0,16)
 remember(debugCombatButton.MouseButton1Click:Connect(function()
     local name=currentTarget and currentTarget.Name or "none"
     local hp=hitWatch.lastHP
-    print("[RHYE ABOVE V7 DEBUG]", "Target="..name,
+    print("[RHYE ABOVE V8 DEBUG]", "Target="..name,
         "HP="..(hp and tostring(hp) or "unknown"),
         "ConfirmedDecreases="..tostring(hitWatch.confirmed),
         "AttackAttempts="..tostring(hitWatch.attacks),
@@ -1856,7 +1924,14 @@ remember(debugCombatButton.MouseButton1Click:Connect(function()
         "StuckRetries="..tostring(stuckBudget.strikes),
         "NavMode="..tostring(nav.mode),
         "NavFailures="..tostring(nav.failures),
-        "SpacingMode="..cfg.spacingMode)
+        "SpacingMode="..cfg.spacingMode,
+        "WalkMethod="..cfg.walkMethod,
+        "DriveState="..tostring(nav.driveMode),
+        "SpeedActual="..string.format("%.2f st/s",nav.actualSpeed),
+        "DriverTicks="..tostring(nav.driveSamples),
+        "HasMoveGoal="..tostring(nav.steerGoal~=nil),
+        "RootAnchored="..tostring((player.Character and player.Character:FindFirstChild("HumanoidRootPart") and player.Character.HumanoidRootPart.Anchored) or false),
+        "Route="..tostring(nav.lastPathError))
     setStatus("Combat diagnostics printed to F9")
 end))
 section("OTHER COMBAT OPTIONS")
@@ -1872,7 +1947,7 @@ remember(presetButton.MouseButton1Click:Connect(function()
     local preset={mobWeapon="Sword",attackRange=5,safeDistance=4.3,
         maxSearch=300,walkSpeed=22,attackInterval=0.5,spacingMode="Ranged Only",
         autoKite=true,lowHealthSafety=true,lowHealthThreshold=40,
-        autoFixStuck=true,stuckTimeout=2.8,autoSwitchNoDamage=true,
+        walkMethod="Hybrid",autoFixStuck=true,stuckTimeout=2.8,autoSwitchNoDamage=true,
         noDamageTimeout=10,skipCooldown=16}
     for key,value in pairs(preset) do
         cfg[key]=value
@@ -2002,7 +2077,7 @@ local function startHunt()
     nextAttack=0
     clearNavigation()
     farmButton.Text="STOP AUTO HUNT"
-    setStatus("Auto Hunt V7 started: "..cfg.targetGroup)
+    setStatus("Auto Hunt V8 started: "..cfg.targetGroup.." | "..cfg.walkMethod)
 end
 remember(farmButton.MouseButton1Click:Connect(function()
     if running then stopHunt() else startHunt() end
@@ -2058,7 +2133,7 @@ end))
 -- ---------------- Runtime ----------------
 refreshNPCs()
 scanPortals()
-if not loadedConfig and cfg.autoSave then scheduleSave(true) end
+if (not loadedConfig or navConfigUpgrade) and cfg.autoSave then scheduleSave(true) end
 if cfg.autoStart and cfg.farmMobs then startHunt() end
 
 remember(Workspace.DescendantAdded:Connect(function(item)
@@ -2132,7 +2207,7 @@ local lastApproachTarget,approachCache,approachAt,mobCachePos=nil,nil,0,nil
 local lastPortalFailureAt=0
 local function skipMob(target,now,why)
     blocked[target]=now+cfg.skipCooldown
-    warn("[RHYE ABOVE V7] Skip "..target.Name.." for "..cfg.skipCooldown.."s | "..why)
+    warn("[RHYE ABOVE V8] Skip "..target.Name.." for "..cfg.skipCooldown.."s | "..why)
     currentTarget=nil
     resetHitWatch(nil,now);resetMovementWatch(nil,nil,nil,nil,now)
     kiteActive=false;kiteTarget=nil;lastRetreatGoal=nil
@@ -2333,7 +2408,8 @@ task.spawn(function()
                 elseif not success then
                     setStatus("Path to "..target.Name..": "..info)
                 else
-                    setStatus("Chasing "..target.Name.." ["..info.."]"..
+                    setStatus("Chasing "..target.Name.." ["..info.."] "..
+                        string.format("| mv %.1f st/s",nav.actualSpeed)..
                         (recoveryInfo and " | "..recoveryInfo or ""))
                 end
             else
@@ -2419,5 +2495,5 @@ end)
 
 setStatus(loadedConfig and "Loaded shared config | "..cfg.targetGroup.." | Anti-AFK "..(cfg.autoAfk and "ON" or "OFF")
     or "Ready | Shared config | Anti-AFK ON")
-print("[RHYE ABOVE] V7 Stable Chase / Smart Unstuck / No Damage loaded. Shared config: "..CONFIG_FILE)
+print("[RHYE ABOVE] V8 post-control movement + navigation loaded. Shared config: "..CONFIG_FILE)
 print("[RHYE ABOVE] Group: "..cfg.targetGroup.."  AutoReturn: "..tostring(cfg.autoReturn).."  AutoAFK: "..tostring(cfg.autoAfk))
