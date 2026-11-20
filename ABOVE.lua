@@ -1,5 +1,5 @@
 --[[
- RHYE Hub | ABOVE Auto Hunt V6.0 — Smoother Walking + Portal Teleport
+ RHYE Hub | ABOVE Auto Hunt V7.0 — Stable Chase + Smart Unstuck + No-Damage Switch
  PlaceId: 124357835578554
 
  Community client-side helper. Uses visible NPC models, PathfindingService,
@@ -42,7 +42,13 @@ local defaults = {
     targetGroup = "Slime", -- Only Slime or Skeleton (all variants)
     mobWeapon = "Sword",
     attackRange = 5,
-    autoKite = true, -- default: keep a safer distance from melee mobs
+    autoKite = true, -- master toggle; Sword is excluded by default via spacingMode
+    spacingMode = "Ranged Only", -- Off / Ranged Only / All Weapons; avoids Sword kite/chase oscillation
+    autoFixStuck = true,
+    stuckTimeout = 2.8, -- seconds without real progress before recovery
+    autoSwitchNoDamage = true,
+    noDamageTimeout = 10, -- counted only after attack input, not travel time
+    skipCooldown = 16, -- seconds a failed target is deprioritized
     safeDistance = 4.3, -- sword band centers around 4.3; ranged weapons keep farther
     lowHealthSafety = true, -- avoid chasing while critically low on HP
     lowHealthThreshold = 35, -- percent
@@ -105,6 +111,10 @@ cfg.lowHealthThreshold = math.clamp(cfg.lowHealthThreshold,15,60)
 cfg.maxSearch = math.clamp(cfg.maxSearch,60,600)
 cfg.walkSpeed = math.clamp(cfg.walkSpeed,12,32)
 cfg.returnDelay = math.clamp(cfg.returnDelay,8,45)
+cfg.stuckTimeout = math.clamp(cfg.stuckTimeout,1.8,8)
+cfg.noDamageTimeout = math.clamp(cfg.noDamageTimeout,6,30)
+cfg.skipCooldown = math.clamp(cfg.skipCooldown,8,60)
+if not table.find({"Off","Ranged Only","All Weapons"},cfg.spacingMode) then cfg.spacingMode="Ranged Only" end
 if cfg.walkMethod~="MoveTo" and cfg.walkMethod~="Steering" then cfg.walkMethod="MoveTo" end
 if cfg.teleportDestination~="Slime" and cfg.teleportDestination~="Ruins" then cfg.teleportDestination="Slime" end
 
@@ -146,6 +156,21 @@ local nav = {
     lastMovedAt=0, pathRequestId=0, routeUnreachableUntil=0,
 }
 local blocked = setmetatable({},{__mode="k"})
+-- Damage telemetry is best-effort. Some ABOVE NPCs do not replicate HP.
+-- Never equate a successful simulated click with an accepted server hit.
+local hitWatch = {target=nil,lastHP=nil,hpVisible=false,attackStart=nil,attacks=0,confirmed=0,selectedAt=0,nearBlockedSince=nil}
+local movementWatch = {target=nil,mode=nil,anchor=nil,goal=nil,since=0,attempts=0,lastRecovery=0}
+local stuckBudget = {target=nil,strikes=0,lastStrike=0}
+local function resetHitWatch(target,now)
+    hitWatch.target=target;hitWatch.lastHP=nil;hitWatch.hpVisible=false
+    hitWatch.attackStart=nil;hitWatch.attacks=0;hitWatch.confirmed=0
+    hitWatch.selectedAt=now or os.clock();hitWatch.nearBlockedSince=nil
+end
+local function resetMovementWatch(target,mode,root,goal,now)
+    movementWatch.target=target;movementWatch.mode=mode
+    movementWatch.anchor=root;movementWatch.goal=goal
+    movementWatch.since=now or os.clock();movementWatch.attempts=0;movementWatch.lastRecovery=0
+end
 
 local function remember(conn)
     table.insert(connections,conn)
@@ -269,6 +294,28 @@ local function healthInfo(inst)
         for _,name in ipairs({"Health","HP","CurrentHealth"}) do
             local val=inst:FindFirstChild(name,true)
             if val and (val:IsA("NumberValue") or val:IsA("IntValue")) then return val.Value,true end
+        end
+    end
+    -- Some custom NPCs expose HP only via a BillboardGui label. Only accept
+    -- explicitly named HP/Health labels to avoid reading damage/level numbers.
+    if inst:IsA("Model") then
+        local plate=inst:FindFirstChildWhichIsA("BillboardGui",true)
+        if plate then
+            for _,obj in ipairs(plate:GetDescendants()) do
+                if obj:IsA("TextLabel") then
+                    local n=obj.Name:lower()
+                    if n:find("health",1,true) or n=="hp" or n=="hptext" then
+                        local a,b=obj.Text:match("(%d[%d,%.]*)%s*/%s*(%d[%d,%.]*)")
+                        if a and b then
+                            local current=tonumber((a:gsub(",","")))
+                            local maximum=tonumber((b:gsub(",","")))
+                            if current and maximum and maximum>0 and current<=maximum then
+                                return current,true
+                            end
+                        end
+                    end
+                end
+            end
         end
     end
     return nil,false
@@ -502,16 +549,15 @@ local function chooseTarget(root)
         end
     end
     if not targetAlive(currentTarget) or currentDist>cfg.maxSearch then return best end
-    if blocked[currentTarget] and blocked[currentTarget]>now and currentDist>cfg.attackRange+1.5 then
-        return best
-    end
+    -- A blacklisted target is never selected again until its cooldown expires,
+    -- even if it is standing within attack range.
+    if blocked[currentTarget] and blocked[currentTarget]>now then return best end
     if not best or currentTarget==best then return currentTarget end
-    -- Keep a stable target for at least a short moment; however don't ignore
-    -- another mob significantly closer (V5's near-combat lock caused misses).
-    if now-lastTargetSwitchAt<1.4 then return currentTarget end
-    if bestDist+3.5<currentDist and bestDist<currentDist*0.72 then
-        return best
-    end
+    -- Once attacks have started, keep this mob until death, no-damage timeout,
+    -- or route failure. Prevents target oscillation in crowded slime packs.
+    if hitWatch.target==currentTarget and hitWatch.attackStart then return currentTarget end
+    if now-lastTargetSwitchAt<3.5 then return currentTarget end
+    if bestDist+5<currentDist and bestDist<currentDist*0.72 then return best end
     return currentTarget
 end
 
@@ -599,6 +645,15 @@ local function los(from,to,excluded)
     if direction.Magnitude<0.1 then return true end
     return Workspace:Raycast(origin,direction,params)==nil
 end
+local function walkingCorridor(from,to,excluded)
+    local along=flat(to-from)
+    if along.Magnitude<1.2 then return true end
+    local side=Vector3.new(-along.Z,0,along.X).Unit*1.05
+    -- Checking both shoulders catches edges of cave walls missed by a
+    -- single center ray. Use only in navigation, not for combat LOS.
+    return los(from,to,excluded) and los(from+side,to+side,excluded)
+        and los(from-side,to-side,excluded)
+end
 local function findFloorAt(position,excluded)
     local list={}
     if player.Character then list[#list+1]=player.Character end
@@ -657,7 +712,7 @@ local function approachPoint(myPos,mobPart,mobModel,range)
         if floor then
             local goal=Vector3.new(sample.X,floor.Y+2.7,sample.Z)
             local visible=los(goal,mobPos,mobModel)
-            local direct=los(myPos,goal,mobModel)
+            local direct=walkingCorridor(myPos,goal,mobModel)
                 and groundCorridor(myPos,goal,mobModel)
             local heightPenalty=myFloor and math.abs(floor.Y-myFloor.Y)*2.5 or 0
             local score=horizontalDistance(myPos,goal)+(visible and 0 or 70)
@@ -675,7 +730,7 @@ local function approachPoint(myPos,mobPart,mobModel,range)
         local floorStep=findFloorAt(step,mobModel)
         if floorStep and (not myFloor or math.abs(myFloor.Y-floorStep.Y)<3.5) then
             local dest=Vector3.new(step.X,floorStep.Y+2.7,step.Z)
-            if los(myPos,dest,mobModel) and groundCorridor(myPos,dest,mobModel) then
+            if walkingCorridor(myPos,dest,mobModel) and groundCorridor(myPos,dest,mobModel) then
                 return dest
             end
         end
@@ -706,7 +761,7 @@ local function safeShortStep(from,goal,excluded)
             local floor=findFloorAt(pt,excluded)
             if floor and math.abs(floor.Y-fromFloor.Y)<3.7 then
                 local destination=Vector3.new(pt.X,floor.Y+2.7,pt.Z)
-                if los(from,destination,excluded) and groundCorridor(from,destination,excluded) then
+                if walkingCorridor(from,destination,excluded) and groundCorridor(from,destination,excluded) then
                     local closer=horizontalDistance(destination,goal)
                     local score=closer+math.abs(ang)*2.8
                     if score<bestScore then best,bestScore=destination,score end
@@ -734,7 +789,7 @@ local function safeRetreatPoint(from,enemyPos,enemy,needed)
             local floor=findFloorAt(sample,enemy)
             if floor and math.abs(floor.Y-fromFloor.Y)<3.3 then
                 local destination=Vector3.new(sample.X,floor.Y+2.7,sample.Z)
-                if los(from,destination,enemy) and groundCorridor(from,destination,enemy) then
+                if walkingCorridor(from,destination,enemy) and groundCorridor(from,destination,enemy) then
                     local gain=horizontalDistance(destination,enemyPos)-horizontalDistance(from,enemyPos)
                     local score=gain*3-math.abs(ang)*1.8
                     if gain>0.6 and score>bestScore then best,bestScore=destination,score end
@@ -953,7 +1008,7 @@ local function navMove(humanoid,root,goal,subject,exclude,mode)
     nav.wanted=goal
     local remaining=horizontalDistance(root.Position,goal)
     local direct=remaining<42
-        and los(root.Position,goal,exclude)
+        and walkingCorridor(root.Position,goal,exclude)
         and groundCorridor(root.Position,goal,exclude)
 
     -- Only abandon a waypoint route if there's a clear direct corridor; this
@@ -1047,6 +1102,79 @@ local function navMove(humanoid,root,goal,subject,exclude,mode)
         end
     end
     return true,"Searching safe route"
+end
+
+-- Navigation watchdog: detect ZERO/poor progress rather than counting
+-- Humanoid:MoveTo calls. Use a jump and forced replan; then skip this target.
+local function monitorMovement(hum,root,goal,target,mode,now)
+    if not cfg.autoFixStuck or not goal then return false,nil end
+    if stuckBudget.target~=target then
+        stuckBudget.target=target;stuckBudget.strikes=0;stuckBudget.lastStrike=0
+    end
+    local remaining=horizontalDistance(root.Position,goal)
+    if remaining<3.0 then
+        resetMovementWatch(target,mode,root.Position,goal,now)
+        return false,nil
+    end
+    if movementWatch.target~=target or movementWatch.mode~=mode or not movementWatch.anchor
+        or (movementWatch.goal and horizontalDistance(goal,movementWatch.goal)>11) then
+        resetMovementWatch(target,mode,root.Position,goal,now)
+        return false,nil
+    end
+    -- Progress = player actually moved, or got significantly closer to the goal.
+    local moved=horizontalDistance(root.Position,movementWatch.anchor)
+    local oldDist=horizontalDistance(movementWatch.anchor,movementWatch.goal or goal)
+    if remaining<oldDist-1.25 then
+        movementWatch.anchor=root.Position
+        movementWatch.goal=goal
+        movementWatch.since=now
+        if movementWatch.attempts>0 then movementWatch.attempts=movementWatch.attempts-1 end
+        return false,nil
+    end
+    -- A sideways loop around a rock does NOT reset the progress timer.
+    -- The watchdog relies on reaching the current waypoint, not distance walked.
+    if now-movementWatch.since<cfg.stuckTimeout then return false,nil end
+    movementWatch.since=now
+    movementWatch.attempts=movementWatch.attempts+1
+    if now-stuckBudget.lastStrike>26 then stuckBudget.strikes=0 end
+    stuckBudget.strikes=stuckBudget.strikes+1
+    stuckBudget.lastStrike=now
+    if stuckBudget.strikes>=3 then
+        return true,"3 stuck recoveries failed (mob temporarily ignored)"
+    end
+    -- Repath/jump once. Avoid sending a constantly changing sideways MoveTo.
+    hum.Jump=true
+    nav.retryNow=true;nav.lastMoveGoal=nil;nav.progressGoal=nil
+    if stuckBudget.strikes==2 then
+        nav.waypoints=nil
+        local step=safeShortStep(root.Position,goal,target)
+        if step then sendMove(hum,step,true) end
+    else
+        sendMove(hum,goal,true)
+    end
+    return false,"Recovering "..tostring(stuckBudget.strikes).."/2"
+end
+
+local function registerAttack(target,now)
+    if hitWatch.target~=target then resetHitWatch(target,now) end
+    if not hitWatch.attackStart then hitWatch.attackStart=now end
+    hitWatch.attacks=hitWatch.attacks+1
+end
+local function observeTargetHP(target,hp,known,now)
+    if hitWatch.target~=target then resetHitWatch(target,now) end
+    if known and type(hp)=="number" then
+        hitWatch.hpVisible=true
+        if hitWatch.lastHP and hp<hitWatch.lastHP-0.001 then
+            -- Replicated decrease is the best evidence of a successful hit.
+            hitWatch.confirmed=hitWatch.confirmed+1
+            hitWatch.attackStart=nil;hitWatch.attacks=0
+        end
+        hitWatch.lastHP=hp
+    end
+end
+local function shouldSkipNoDamage(now)
+    return cfg.autoSwitchNoDamage and hitWatch.attackStart~=nil
+        and hitWatch.attacks>=3 and now-hitWatch.attackStart>=cfg.noDamageTimeout
 end
 
 -- ---------------- Teleporter return support ----------------
@@ -1391,6 +1519,8 @@ end
 local function stopHunt()
     running=false
     currentTarget=nil
+    resetHitWatch(nil)
+    resetMovementWatch(nil,nil,nil,nil)
     activePortal=nil
     recovering=false
     lastRetreatGoal=nil
@@ -1461,7 +1591,7 @@ local function button(parent,text,size)
 end
 
 gui = create("ScreenGui",{
-    Name="RHYE_ABOVE_AutoHunt_V6", ResetOnSpawn=false, IgnoreGuiInset=true,
+    Name="RHYE_ABOVE_AutoHunt_V7", ResetOnSpawn=false, IgnoreGuiInset=true,
     ZIndexBehavior=Enum.ZIndexBehavior.Sibling, DisplayOrder=10020,
 },player:WaitForChild("PlayerGui"))
 local main = create("Frame",{
@@ -1509,7 +1639,7 @@ hideNav.Position=UDim2.new(0,10,1,-52)
 local header=label(main,"RHYE Hub  /  Combat",18,true)
 header.Position=UDim2.fromOffset(93,19)
 header.Size=UDim2.fromOffset(370,25)
-local subtitle=label(main,"ABOVE · Smooth Walk + Slime / Ruins Teleport V6",11,false,colors.muted)
+local subtitle=label(main,"ABOVE · Stable Chase + Auto Fix Stuck V7",11,false,colors.muted)
 subtitle.Position=UDim2.fromOffset(94,45)
 subtitle.Size=UDim2.fromOffset(370,20)
 local close=button(main,"×",24)
@@ -1537,7 +1667,7 @@ local infoFrame=create("Frame",{
 local infoLabel=label(infoFrame,"RHYE HUB  ·  ABOVE",23,true,colors.green)
 infoLabel.Size=UDim2.new(1,0,0,40)
 local infoBody=label(infoFrame,
-    "AUTO HUNT V6 · STEADY WALK + PORTAL TRAVEL\n\n1. Targets: Slime (all kinds) or Skeleton (all kinds).\n2. MoveTo is the default; try Steering if character stalls.\n3. Stable waypoints, repath only on genuine failure.\n4. TELEPORT supports Slime and Ruins through game portals.\n5. Stand near a portal and BIND if it is not recognized.\n6. HOME -> HUB may be required for multiple hops.\n7. Ruins may require legitimate unlock progress.\n8. Settings are shared in Potassium workspace:\n   RHYE_Hub/ABOVE_Global_Config.json.\n\nClient-side walking and portal prompts depend on server rules.\nTeleport is not an instant server bypass; Anti-AFK not guaranteed.",
+    "AUTO HUNT V7 · ANTI-STUCK + 10S NO-DAMAGE SWITCH\n\n1. Targets: Slime (all kinds) or Skeleton (all kinds).\n2. Sword spacing is disabled by default to stop chase/retreat loops.\n3. Auto Fix Stuck watches real movement; 10s no-damage switch uses observed mob HP when available.\n4. TELEPORT supports Slime and Ruins through game portals.\n5. Stand near a portal and BIND if it is not recognized.\n6. HOME -> HUB may be required for multiple hops.\n7. Ruins may require legitimate unlock progress.\n8. Settings are shared in Potassium workspace:\n   RHYE_Hub/ABOVE_Global_Config.json.\n\nClient-side walking and portal prompts depend on server rules.\nTeleport is not an instant server bypass; Anti-AFK not guaranteed.",
     13,false,colors.muted)
 infoBody.Size=UDim2.new(1,-18,1,-60)
 infoBody.Position=UDim2.fromOffset(0,50)
@@ -1625,6 +1755,7 @@ local function cycleRow(title,description,key,options)
         cfg[key]=options[(idx%#options)+1]
         if key=="targetGroup" then
             currentTarget=nil;activePortal=nil;clearNavigation()
+            resetHitWatch(nil);resetMovementWatch(nil,nil,nil,nil)
             blocked=setmetatable({},{__mode="k"})
             lastEnemySeen=os.clock()-cfg.returnDelay
         end
@@ -1695,14 +1826,40 @@ cycleRow("Mob Weapon","Equip via Tool when available; otherwise use hotbar.","mo
 
 section("ATTACK & SMOOTH MOVEMENT")
 sliderRow("Attack Range","Combat limit (Sword capped near 5.1). NOT monster detection range.","attackRange",2,35,0.5," st")
-toggleRow("Auto Combat Spacing","Back away when mobs get too close; resume attacking.","autoKite")
-sliderRow("Safe Combat Distance","Preferred spacing. Sword: start at 4-4.5; stay within actual reach.","safeDistance",2.5,20,0.5," st")
+toggleRow("Auto Combat Spacing","Master toggle for distance management.","autoKite")
+cycleRow("Spacing Mode","Ranged Only = NO Sword kite loop (recommended).","spacingMode",{"Ranged Only","Off","All Weapons"})
+sliderRow("Safe Combat Distance","Preferred gap only when spacing applies; must be within weapon reach.","safeDistance",2.5,20,0.5," st")
 toggleRow("Low HP Survival","Retreat and pause attack until HP recovers.","lowHealthSafety")
 sliderRow("Low HP Threshold","Start defensive retreat under this percent HP.","lowHealthThreshold",15,60,5,"%")
 sliderRow("Attack Interval","Added delay, does not bypass game cooldown.","attackInterval",0.15,2,0.05," s")
 sliderRow("Search Radius","Mob detection ONLY (separate from Attack Range). Requires client streaming.","maxSearch",60,600,10," st")
 sliderRow("Walk Speed","Client Humanoid speed while hunting; may be limited.","walkSpeed",12,32,1,"")
-cycleRow("Walk Method","MoveTo = stable default; Steering = continuous walking (experimental).","walkMethod",{"MoveTo","Steering"})
+cycleRow("Walk Method","MoveTo is recommended; Steering is experimental.","walkMethod",{"MoveTo","Steering"})
+section("STUCK RECOVERY & FAILED TARGETS")
+toggleRow("Auto Fix Stuck","Jump, replan, then skip blocked mob if still stuck.","autoFixStuck")
+sliderRow("Stuck Timeout","Seconds without progress toward waypoint before recovery.","stuckTimeout",2,8,0.5," s")
+toggleRow("Switch After No Damage","Change mob when attacks do not reduce visible HP.","autoSwitchNoDamage")
+sliderRow("No Damage Timeout","Start counting AFTER attack inputs, default 10 seconds.","noDamageTimeout",6,30,1," s")
+sliderRow("Skipped Mob Cooldown","Wait before retrying an unreachable/no-damage mob.","skipCooldown",8,60,2," s")
+local debugCombatRow=settingRow("Combat Diagnostic (F9)","See target HP evidence, attack attempts and stuck retries.",61)
+local debugCombatButton=button(debugCombatRow,"DEBUG COMBAT",11)
+debugCombatButton.Size=UDim2.fromOffset(146,29)
+debugCombatButton.Position=UDim2.new(1,-161,0,16)
+remember(debugCombatButton.MouseButton1Click:Connect(function()
+    local name=currentTarget and currentTarget.Name or "none"
+    local hp=hitWatch.lastHP
+    print("[RHYE ABOVE V7 DEBUG]", "Target="..name,
+        "HP="..(hp and tostring(hp) or "unknown"),
+        "ConfirmedDecreases="..tostring(hitWatch.confirmed),
+        "AttackAttempts="..tostring(hitWatch.attacks),
+        "AttackWindow="..(hitWatch.attackStart and string.format("%.1fs",os.clock()-hitWatch.attackStart) or "not started"),
+        "StuckRetries="..tostring(stuckBudget.strikes),
+        "NavMode="..tostring(nav.mode),
+        "NavFailures="..tostring(nav.failures),
+        "SpacingMode="..cfg.spacingMode)
+    setStatus("Combat diagnostics printed to F9")
+end))
+section("OTHER COMBAT OPTIONS")
 cycleRow("Attack Method","Mouse = game LMB; Tool = Tool:Activate().","attackMode",{"Mouse","Tool","Auto"})
 toggleRow("Auto Chase","Smooth stable waypoints + replan on obstruction only.","autoChase")
 toggleRow("Auto Equip","Try equipping a matching Roblox Tool.","autoEquip")
@@ -1713,16 +1870,19 @@ presetButton.Size=UDim2.fromOffset(146,29)
 presetButton.Position=UDim2.new(1,-161,0,16)
 remember(presetButton.MouseButton1Click:Connect(function()
     local preset={mobWeapon="Sword",attackRange=5,safeDistance=4.3,
-        maxSearch=300,walkSpeed=22,attackInterval=0.5,
-        autoKite=true,lowHealthSafety=true,lowHealthThreshold=40}
+        maxSearch=300,walkSpeed=22,attackInterval=0.5,spacingMode="Ranged Only",
+        autoKite=true,lowHealthSafety=true,lowHealthThreshold=40,
+        autoFixStuck=true,stuckTimeout=2.8,autoSwitchNoDamage=true,
+        noDamageTimeout=10,skipCooldown=16}
     for key,value in pairs(preset) do
         cfg[key]=value
         if renderSetting[key] then renderSetting[key]() end
     end
     kiteActive=false;kiteTarget=nil;lastRetreatGoal=nil
+    resetMovementWatch(nil,nil,nil,nil,os.clock())
     clearNavigation()
     changed(true)
-    setStatus("Sword preset applied. Watch actual damage; safety not guaranteed")
+    setStatus("Sword preset applied: no melee kite; auto stuck/no-damage enabled")
 end))
 local mobScanRow=settingRow("Mob Detection Debug","Force reindex and print recognized NPCs to F9.",61)
 local mobScanBtn=button(mobScanRow,"SCAN MOBS (F9)",11)
@@ -1833,6 +1993,8 @@ local function startHunt()
     if not cfg.farmMobs then setStatus("Enable Farm Mobs first") return end
     running=true
     currentTarget=nil
+    resetHitWatch(nil)
+    resetMovementWatch(nil,nil,nil,nil)
     lastEnemySeen=os.clock()-cfg.returnDelay
     recovering=false
     lastHealthReading=nil
@@ -1840,7 +2002,7 @@ local function startHunt()
     nextAttack=0
     clearNavigation()
     farmButton.Text="STOP AUTO HUNT"
-    setStatus("Auto Hunt V6 started: "..cfg.targetGroup)
+    setStatus("Auto Hunt V7 started: "..cfg.targetGroup)
 end
 remember(farmButton.MouseButton1Click:Connect(function()
     if running then stopHunt() else startHunt() end
@@ -1912,6 +2074,8 @@ remember(Workspace.DescendantAdded:Connect(function(item)
 end))
 remember(player.CharacterAdded:Connect(function()
     currentTarget=nil
+    resetHitWatch(nil)
+    resetMovementWatch(nil,nil,nil,nil)
     activePortal=nil
     lastEnemySeen=os.clock()-cfg.returnDelay
     recovering=false
@@ -1966,6 +2130,18 @@ end)
 local lastMovementSpeedSet=0
 local lastApproachTarget,approachCache,approachAt,mobCachePos=nil,nil,0,nil
 local lastPortalFailureAt=0
+local function skipMob(target,now,why)
+    blocked[target]=now+cfg.skipCooldown
+    warn("[RHYE ABOVE V7] Skip "..target.Name.." for "..cfg.skipCooldown.."s | "..why)
+    currentTarget=nil
+    resetHitWatch(nil,now);resetMovementWatch(nil,nil,nil,nil,now)
+    kiteActive=false;kiteTarget=nil;lastRetreatGoal=nil
+    lastApproachTarget=nil;approachCache=nil;mobCachePos=nil
+    clearNavigation()
+    -- Prevent auto-return from treating temporarily excluded mobs as an empty map.
+    lastEnemySeen=now
+    setStatus("SKIP "..target.Name..": "..why)
+end
 
 task.spawn(function()
     while not closed do
@@ -2004,6 +2180,8 @@ task.spawn(function()
             if currentTarget~=target then
                 currentTarget=target
                 lastTargetSwitchAt=now
+                resetHitWatch(target,now)
+                resetMovementWatch(nil,nil,nil,nil,now)
                 activePortal=nil
                 clearNavigation()
                 nextAttack=0
@@ -2018,13 +2196,34 @@ task.spawn(function()
             local distance=(part.Position-root.Position).Magnitude
             local hDistance=horizontalDistance(part.Position,root.Position)
             local hp,known=healthInfo(target)
+            observeTargetHP(target,hp,known,now)
+            if shouldSkipNoDamage(now) then
+                local reason=hitWatch.hpVisible
+                    and ("no HP decrease after "..cfg.noDamageTimeout.."s / "..hitWatch.attacks.." attacks")
+                    or ("HP unknown; no confirmed damage for "..cfg.noDamageTimeout.."s / retrying")
+                skipMob(target,now,reason)
+                continue
+            end
             local tool=equipWeapon(character,hum,cfg.mobWeapon)
             local attackReach,idealGap,tooClose,settleAt=weaponCombatBounds(tool)
             targetText.Text=string.format("%s · %.1f st | Atk %.1f | Gap %.1f%s",target.Name,distance,
-                attackReach,idealGap,known and string.format(" | HP %.0f",hp) or "")
+                attackReach,idealGap,known and string.format(" | HP %.0f",hp) or " | HP ?")
             local vertical=math.abs(root.Position.Y-part.Position.Y)
             local inRange=hDistance<=attackReach-0.20 and vertical<=7
                 and los(root.Position,part.Position,target)
+            -- If close to a mob for too long but unable to obtain a valid
+            -- attack line, a repeatedly recalculated approach ring won't help.
+            -- Give this mob a cooldown and try another one instead.
+            if cfg.autoFixStuck and cfg.autoChase and not inRange
+                and not hitWatch.attackStart and hDistance<math.max(14,attackReach+7) then
+                hitWatch.nearBlockedSince=hitWatch.nearBlockedSince or now
+                if now-hitWatch.nearBlockedSince>12 then
+                    skipMob(target,now,"close to mob but cannot get attack line")
+                    continue
+                end
+            else
+                hitWatch.nearBlockedSince=nil
+            end
 
             if cfg.lowHealthSafety and measuredHealthRatio then
                 if measuredHealthRatio<=cfg.lowHealthThreshold/100 then recovering=true end
@@ -2045,11 +2244,16 @@ task.spawn(function()
                 lastRetreatGoal=nil
             end
             local recentHit=(now-lastDamageAt<0.85)
-            if cfg.autoKite then
+            local rangedWeapon=(cfg.mobWeapon=="Bow" or cfg.mobWeapon=="Scepter")
+                or (cfg.mobWeapon=="Equipped" and tool
+                    and (matchingWeapon(tool,"Bow") or matchingWeapon(tool,"Scepter")))
+            local spacingEnabled=cfg.autoKite and (cfg.spacingMode=="All Weapons"
+                or (cfg.spacingMode=="Ranged Only" and rangedWeapon))
+            if spacingEnabled then
                 if hDistance<tooClose then
                     kiteActive=true
                     kiteUntil=now+0.55
-                elseif cfg.mobWeapon~="Sword" and recentHit and hDistance<idealGap+0.2 then
+                elseif rangedWeapon and recentHit and hDistance<idealGap+0.2 then
                     kiteActive=true
                     kiteUntil=math.max(kiteUntil,now+0.55)
                 elseif hDistance>=settleAt and now>=kiteUntil then
@@ -2092,7 +2296,8 @@ task.spawn(function()
                 end
                 if not recovering and inRange and now>=nextAttack then
                     nextAttack=now+cfg.attackInterval
-                    attackTarget(part,tool)
+                    local ok=attackTarget(part,tool)
+                    if ok then registerAttack(target,now) end
                 end
             elseif inRange then
                 lastRetreatGoal=nil
@@ -2100,6 +2305,7 @@ task.spawn(function()
                 if now>=nextAttack then
                     nextAttack=now+cfg.attackInterval
                     local ok,method=attackTarget(part,tool)
+                    if ok then registerAttack(target,now) end
                     setStatus(ok and ("Attacking "..target.Name.." ["..method.."]")
                         or ("Attack input unavailable: "..method))
                 end
@@ -2108,32 +2314,27 @@ task.spawn(function()
                 if lastApproachTarget~=target or not approachCache
                     or now-approachAt>7.0
                     or (mobCachePos and horizontalDistance(part.Position,mobCachePos)>8)
-                    or (horizontalDistance(root.Position,approachCache)<2.1 and not inRange)
-                    or nav.failures>=3 then
+                    or (horizontalDistance(root.Position,approachCache)<2.1
+                        and not inRange and now-approachAt>2.8)
+                    or (nav.failures>=3 and now-approachAt>2.0) then
                     approachCache=approachPoint(root.Position,part,target,idealGap)
                     approachAt=now
                     lastApproachTarget=target
                     mobCachePos=part.Position
                 end
                 local success,info=navMove(hum,root,approachCache,target,target,"approach")
-                if not success and nav.failures>=4 then
-                    -- A path failure should not make a mob standing right in
-                    -- front of the player "disappear" from Auto Hunt.
-                    blocked[target]=now+5.0
-                    clearNavigation()
-                    currentTarget=nil
-                    lastApproachTarget=nil
-                    approachCache=nil
-                    setStatus("Route blocked: choosing another mob")
-                    if now-nav.lastRouteWarningAt>3 then
-                        warn("[RHYE ABOVE NAV] Route blocked to "..target.Name..
-                            " | distance "..math.floor(hDistance).." | switching target")
-                        nav.lastRouteWarningAt=now
-                    end
+                local activeWp=nav.waypoints and nav.waypoints[nav.index]
+                local monitoredGoal=activeWp and activeWp.Position or approachCache
+                local stuck,recoveryInfo=monitorMovement(hum,root,monitoredGoal,target,"approach",now)
+                if stuck then
+                    skipMob(target,now,"stuck: "..tostring(recoveryInfo))
+                elseif not success and nav.failures>=4 then
+                    skipMob(target,now,"pathfinding failed repeatedly")
                 elseif not success then
                     setStatus("Path to "..target.Name..": "..info)
                 else
-                    setStatus("Chasing "..target.Name.." ["..info.."]")
+                    setStatus("Chasing "..target.Name.." ["..info.."]"..
+                        (recoveryInfo and " | "..recoveryInfo or ""))
                 end
             else
                 setStatus("Target detected but outside Attack Range: "..target.Name)
@@ -2150,6 +2351,20 @@ task.spawn(function()
                 continue
             end
             recovering=false
+            local cooldownMob=false
+            for _,npc in ipairs(npcCache) do
+                if blocked[npc] and blocked[npc]>now and targetAlive(npc) then
+                    local p=findRoot(npc)
+                    if p and horizontalDistance(root.Position,p.Position)<=cfg.maxSearch then
+                        cooldownMob=true;break
+                    end
+                end
+            end
+            if cooldownMob then
+                if nav.subject then clearNavigation();hum:MoveTo(root.Position) end
+                setStatus("Nearby mobs cooling down after failed route/attack")
+                continue
+            end
             if not cfg.autoReturn then
                 if nav.subject then clearNavigation();hum:MoveTo(root.Position) end
                 setStatus("No visible "..cfg.targetGroup.."; waiting for respawn")
@@ -2204,5 +2419,5 @@ end)
 
 setStatus(loadedConfig and "Loaded shared config | "..cfg.targetGroup.." | Anti-AFK "..(cfg.autoAfk and "ON" or "OFF")
     or "Ready | Shared config | Anti-AFK ON")
-print("[RHYE ABOVE] V6 Improved Walking + Portal Teleport loaded. Shared config: "..CONFIG_FILE)
+print("[RHYE ABOVE] V7 Stable Chase / Smart Unstuck / No Damage loaded. Shared config: "..CONFIG_FILE)
 print("[RHYE ABOVE] Group: "..cfg.targetGroup.."  AutoReturn: "..tostring(cfg.autoReturn).."  AutoAFK: "..tostring(cfg.autoAfk))
