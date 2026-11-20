@@ -1,5 +1,5 @@
 --[[
- RHYE Hub | ABOVE Auto Hunt V8.0 — Post-Control Movement Fix + Navigation Telemetry
+ RHYE Hub | ABOVE Auto Hunt V9.0 — False Arrival + Target Recovery Fix
  PlaceId: 124357835578554
 
  Community client-side helper. Uses visible NPC models, PathfindingService,
@@ -59,7 +59,9 @@ local defaults = {
     maxSearch = 300, -- target acquisition radius, independent of attack distance
     walkSpeed = 20,
     walkMethod = "Hybrid", -- V8 default: post-control directional driving + stable MoveTo/path goals
-    navEngineVersion = 8, -- one-time migration for previously saved V7 configs
+    navEngineVersion = 9, -- V9 keeps the V8 movement driver and updates chase logic
+    autoFixFalseArrival = true, -- never stop at an approach point outside attack reach
+    falseArrivalTimeout = 3.5, -- skip unreachable approach after fallback fails
     teleportDestination = "Slime", -- manual portal travel: Slime or Ruins
     autoChase = true,
     autoEquip = true,
@@ -117,15 +119,17 @@ cfg.returnDelay = math.clamp(cfg.returnDelay,8,45)
 cfg.stuckTimeout = math.clamp(cfg.stuckTimeout,1.8,8)
 cfg.noDamageTimeout = math.clamp(cfg.noDamageTimeout,6,30)
 cfg.skipCooldown = math.clamp(cfg.skipCooldown,8,60)
+cfg.falseArrivalTimeout = math.clamp(cfg.falseArrivalTimeout,2,9)
 if not table.find({"Off","Ranged Only","All Weapons"},cfg.spacingMode) then cfg.spacingMode="Ranged Only" end
 -- Existing users may have V7's MoveTo mode saved; upgrade it once to Hybrid.
 -- Keep other saved settings, including Auto Return / anti-AFK / shared paths.
 local navConfigUpgrade = previous and (tonumber(previous.navEngineVersion) or 0)<8
 if navConfigUpgrade and cfg.walkMethod=="MoveTo" then cfg.walkMethod="Hybrid" end
 if not table.find({"Hybrid","MoveTo","Steering"},cfg.walkMethod) then cfg.walkMethod="Hybrid" end
-cfg.navEngineVersion=8
+cfg.navEngineVersion=9
 if cfg.teleportDestination~="Slime" and cfg.teleportDestination~="Ruins" then cfg.teleportDestination="Slime" end
 
+local falseArrivalWatch
 local running, closed = false, false
 local connections = {}
 local npcCache, npcCacheSet = {}, {}
@@ -162,7 +166,7 @@ local nav = {
     lastGoalChangedAt=0, lastPathRequestGoal=nil, lastPathRequestAt=0,
     steerGoal=nil, steerHum=nil, lastBestDist=nil, lastMovedPos=nil,
     actualSpeed=0, driveSamples=0, driveLastPos=nil, driveLastAt=0,
-    driveCommanded=false, driveMode="idle", driveBindName="RHYE_ABOVE_V8_PostControls",
+    driveCommanded=false, driveMode="idle", driveBindName="RHYE_ABOVE_V9_PostControls",
     lastMovedAt=0, pathRequestId=0, routeUnreachableUntil=0,
 }
 local blocked = setmetatable({},{__mode="k"})
@@ -566,8 +570,11 @@ local function chooseTarget(root)
     -- Once attacks have started, keep this mob until death, no-damage timeout,
     -- or route failure. Prevents target oscillation in crowded slime packs.
     if hitWatch.target==currentTarget and hitWatch.attackStart then return currentTarget end
-    if now-lastTargetSwitchAt<3.5 then return currentTarget end
-    if bestDist+5<currentDist and bestDist<currentDist*0.72 then return best end
+    -- A clearly closer monster must win when we are NOT already dealing damage.
+    -- Avoid chasing a generic Slime 17+ studs away while a variant is right
+    -- beside the player.  Keep a short 1.6s hysteresis to prevent target flicker.
+    if now-lastTargetSwitchAt<1.6 then return currentTarget end
+    if bestDist+4<currentDist and bestDist<currentDist*0.80 then return best end
     return currentTarget
 end
 
@@ -957,7 +964,7 @@ if nav.bindOK then
 else
     -- Fallback if an executor denies BindToRenderStep. This may be less
     -- reliable than post-input movement in games with custom controls.
-    warn("[RHYE ABOVE V8] Post-input movement unavailable: "..tostring(nav.bindError))
+    warn("[RHYE ABOVE V9] Post-input movement unavailable: "..tostring(nav.bindError))
     remember(RunService.Heartbeat:Connect(nav.driveAfterControls))
 end
 
@@ -1659,7 +1666,7 @@ local function button(parent,text,size)
 end
 
 gui = create("ScreenGui",{
-    Name="RHYE_ABOVE_AutoHunt_V8", ResetOnSpawn=false, IgnoreGuiInset=true,
+    Name="RHYE_ABOVE_AutoHunt_V9", ResetOnSpawn=false, IgnoreGuiInset=true,
     ZIndexBehavior=Enum.ZIndexBehavior.Sibling, DisplayOrder=10020,
 },player:WaitForChild("PlayerGui"))
 local main = create("Frame",{
@@ -1707,7 +1714,7 @@ hideNav.Position=UDim2.new(0,10,1,-52)
 local header=label(main,"RHYE Hub  /  Combat",18,true)
 header.Position=UDim2.fromOffset(93,19)
 header.Size=UDim2.fromOffset(370,25)
-local subtitle=label(main,"ABOVE · Post-Control Movement + Navigation V8",11,false,colors.muted)
+local subtitle=label(main,"ABOVE · False Arrival & Target Recovery V9",11,false,colors.muted)
 subtitle.Position=UDim2.fromOffset(94,45)
 subtitle.Size=UDim2.fromOffset(370,20)
 local close=button(main,"×",24)
@@ -1735,7 +1742,7 @@ local infoFrame=create("Frame",{
 local infoLabel=label(infoFrame,"RHYE HUB  ·  ABOVE",23,true,colors.green)
 infoLabel.Size=UDim2.new(1,0,0,40)
 local infoBody=label(infoFrame,
-    "AUTO HUNT V8 · POST-CONTROL MOVEMENT + ANTI-STUCK\n\n1. Targets: Slime (all kinds) or Skeleton (all kinds).\n2. Sword spacing is disabled by default to stop chase/retreat loops.\n3. Auto Fix Stuck watches real movement; 10s no-damage switch uses observed mob HP when available.\n4. TELEPORT supports Slime and Ruins through game portals.\n5. Stand near a portal and BIND if it is not recognized.\n6. HOME -> HUB may be required for multiple hops.\n7. Ruins may require legitimate unlock progress.\n8. Settings are shared in Potassium workspace:\n   RHYE_Hub/ABOVE_Global_Config.json.\n\nClient-side walking and portal prompts depend on server rules.\nTeleport is not an instant server bypass; Anti-AFK not guaranteed.",
+    "AUTO HUNT V9 · FALSE ARRIVAL + TARGET RECOVERY\n\n1. Targets: Slime (all kinds) or Skeleton (all kinds).\n2. Sword spacing is disabled by default to stop chase/retreat loops.\n3. Auto Fix Stuck watches real movement; 10s no-damage switch uses observed mob HP when available.\n4. TELEPORT supports Slime and Ruins through game portals.\n5. Stand near a portal and BIND if it is not recognized.\n6. HOME -> HUB may be required for multiple hops.\n7. Ruins may require legitimate unlock progress.\n8. Settings are shared in Potassium workspace:\n   RHYE_Hub/ABOVE_Global_Config.json.\n\nClient-side walking and portal prompts depend on server rules.\nTeleport is not an instant server bypass; Anti-AFK not guaranteed.",
     13,false,colors.muted)
 infoBody.Size=UDim2.new(1,-18,1,-60)
 infoBody.Position=UDim2.fromOffset(0,50)
@@ -1906,6 +1913,8 @@ cycleRow("Walk Method","Hybrid drives after Roblox controls (recommended); MoveT
 section("STUCK RECOVERY & FAILED TARGETS")
 toggleRow("Auto Fix Stuck","Jump, replan, then skip blocked mob if still stuck.","autoFixStuck")
 sliderRow("Stuck Timeout","Seconds without progress toward waypoint before recovery.","stuckTimeout",2,8,0.5," s")
+toggleRow("Auto Fix False Arrival","Waypoint reached but monster is out of attack range: retry or switch.","autoFixFalseArrival")
+sliderRow("False Arrival Timeout","Seconds after reroute before switching unreachable target.","falseArrivalTimeout",2,9,0.5," s")
 toggleRow("Switch After No Damage","Change mob when attacks do not reduce visible HP.","autoSwitchNoDamage")
 sliderRow("No Damage Timeout","Start counting AFTER attack inputs, default 10 seconds.","noDamageTimeout",6,30,1," s")
 sliderRow("Skipped Mob Cooldown","Wait before retrying an unreachable/no-damage mob.","skipCooldown",8,60,2," s")
@@ -1916,7 +1925,7 @@ debugCombatButton.Position=UDim2.new(1,-161,0,16)
 remember(debugCombatButton.MouseButton1Click:Connect(function()
     local name=currentTarget and currentTarget.Name or "none"
     local hp=hitWatch.lastHP
-    print("[RHYE ABOVE V8 DEBUG]", "Target="..name,
+    print("[RHYE ABOVE V9 DEBUG]", "Target="..name,
         "HP="..(hp and tostring(hp) or "unknown"),
         "ConfirmedDecreases="..tostring(hitWatch.confirmed),
         "AttackAttempts="..tostring(hitWatch.attacks),
@@ -1924,6 +1933,8 @@ remember(debugCombatButton.MouseButton1Click:Connect(function()
         "StuckRetries="..tostring(stuckBudget.strikes),
         "NavMode="..tostring(nav.mode),
         "NavFailures="..tostring(nav.failures),
+        "FalseArrivalAge="..string.format("%.1fs",falseArrivalWatch.fallbackAt>0 and os.clock()-falseArrivalWatch.fallbackAt or 0),
+        "ApproachGoalDist="..string.format("%.1f",nav.wanted and ((player.Character and player.Character:FindFirstChild("HumanoidRootPart")) and horizontalDistance(player.Character.HumanoidRootPart.Position,nav.wanted) or -1) or -1),
         "SpacingMode="..cfg.spacingMode,
         "WalkMethod="..cfg.walkMethod,
         "DriveState="..tostring(nav.driveMode),
@@ -1947,7 +1958,8 @@ remember(presetButton.MouseButton1Click:Connect(function()
     local preset={mobWeapon="Sword",attackRange=5,safeDistance=4.3,
         maxSearch=300,walkSpeed=22,attackInterval=0.5,spacingMode="Ranged Only",
         autoKite=true,lowHealthSafety=true,lowHealthThreshold=40,
-        walkMethod="Hybrid",autoFixStuck=true,stuckTimeout=2.8,autoSwitchNoDamage=true,
+        walkMethod="Hybrid",autoFixStuck=true,stuckTimeout=2.8,
+        autoFixFalseArrival=true,falseArrivalTimeout=3.5,autoSwitchNoDamage=true,
         noDamageTimeout=10,skipCooldown=16}
     for key,value in pairs(preset) do
         cfg[key]=value
@@ -2077,7 +2089,7 @@ local function startHunt()
     nextAttack=0
     clearNavigation()
     farmButton.Text="STOP AUTO HUNT"
-    setStatus("Auto Hunt V8 started: "..cfg.targetGroup.." | "..cfg.walkMethod)
+    setStatus("Auto Hunt V9 started: "..cfg.targetGroup.." | "..cfg.walkMethod)
 end
 remember(farmButton.MouseButton1Click:Connect(function()
     if running then stopHunt() else startHunt() end
@@ -2204,14 +2216,30 @@ end)
 
 local lastMovementSpeedSet=0
 local lastApproachTarget,approachCache,approachAt,mobCachePos=nil,nil,0,nil
+-- A way-point may be reached while the monster is still too far away.  V8
+-- treated this as successful navigation and repeatedly remained motionless.
+falseArrivalWatch={target=nil,fallbackAt=0,firstAt=0,initialMobDistance=math.huge}
+local function clearFalseArrival(target)
+    falseArrivalWatch.target=target
+    falseArrivalWatch.fallbackAt=0
+    falseArrivalWatch.firstAt=0
+    falseArrivalWatch.initialMobDistance=math.huge
+end
+local function mobCenterApproach(part,model,fallbackY)
+    local position=part.Position
+    local floor=findFloorAt(position,model)
+    return floor and Vector3.new(position.X,floor.Y+2.7,position.Z)
+        or Vector3.new(position.X,fallbackY,position.Z)
+end
 local lastPortalFailureAt=0
 local function skipMob(target,now,why)
     blocked[target]=now+cfg.skipCooldown
-    warn("[RHYE ABOVE V8] Skip "..target.Name.." for "..cfg.skipCooldown.."s | "..why)
+    warn("[RHYE ABOVE V9] Skip "..target.Name.." for "..cfg.skipCooldown.."s | "..why)
     currentTarget=nil
     resetHitWatch(nil,now);resetMovementWatch(nil,nil,nil,nil,now)
     kiteActive=false;kiteTarget=nil;lastRetreatGoal=nil
     lastApproachTarget=nil;approachCache=nil;mobCachePos=nil
+    clearFalseArrival(nil)
     clearNavigation()
     -- Prevent auto-return from treating temporarily excluded mobs as an empty map.
     lastEnemySeen=now
@@ -2261,6 +2289,7 @@ task.spawn(function()
                 clearNavigation()
                 nextAttack=0
                 lastApproachTarget=nil;approachCache=nil;mobCachePos=nil
+                clearFalseArrival(target)
                 lastRetreatGoal=nil;kiteActive=false;kiteTarget=nil
             end
             local part=findRoot(target)
@@ -2397,7 +2426,71 @@ task.spawn(function()
                     lastApproachTarget=target
                     mobCachePos=part.Position
                 end
+                -- V8 BUG: An approach goal may already be at the player's feet
+                -- even when the *mob* is 17+ studs away. navMove then reports
+                -- "Arrived", monitorMovement resets because waypoint distance
+                -- is <3, and the character stays still under enemy attacks.
+                -- V9 distinguishes ARRIVED-AT-WAYPOINT from IN-ATTACK-RANGE.
+                local falseArrival=(cfg.autoFixFalseArrival
+                    and horizontalDistance(root.Position,approachCache)<2.4
+                    and hDistance>attackReach+1.4)
+                if falseArrival then
+                    if falseArrivalWatch.target~=target then clearFalseArrival(target) end
+                    if falseArrivalWatch.fallbackAt==0 then
+                        falseArrivalWatch.firstAt=now
+                        falseArrivalWatch.fallbackAt=now
+                        falseArrivalWatch.initialMobDistance=hDistance
+                        -- Approach the mob's ground position; actual combat
+                        -- range still stops us before entering the mob hitbox.
+                        approachCache=mobCenterApproach(part,target,root.Position.Y)
+                        approachAt=now
+                        nav.retryNow=true
+                        nav.lastMoveGoal=nil
+                        nav.progressGoal=nil
+                        clearNavigation()
+                        setStatus("False arrival: recalculating to "..target.Name)
+                    elseif now-falseArrivalWatch.fallbackAt>=cfg.falseArrivalTimeout then
+                        skipMob(target,now,"false arrival: still outside attack reach")
+                        continue
+                    end
+                elseif falseArrivalWatch.target==target
+                    and hDistance<=attackReach+0.4 then
+                    clearFalseArrival(target)
+                end
+
+                -- Watch actual distance to the MOB while trying a fallback,
+                -- not just distance to the last path waypoint.
+                if cfg.autoFixFalseArrival and falseArrivalWatch.target==target
+                    and falseArrivalWatch.fallbackAt>0 then
+                    if hDistance<falseArrivalWatch.initialMobDistance-2.0 then
+                        clearFalseArrival(target)
+                    elseif now-falseArrivalWatch.fallbackAt>=cfg.falseArrivalTimeout
+                        and hDistance>attackReach+1.4 and nav.actualSpeed<3 then
+                        skipMob(target,now,"reroute failed to approach mob")
+                        continue
+                    end
+                end
                 local success,info=navMove(hum,root,approachCache,target,target,"approach")
+                -- If route reported 'Arrived' despite the mob being far away,
+                -- keep a second independent watchdog; a waypoint alone is not
+                -- evidence that an attack can be made.
+                if cfg.autoFixFalseArrival and info=="Arrived"
+                    and hDistance>attackReach+1.4 then
+                    if falseArrivalWatch.target~=target then clearFalseArrival(target) end
+                    if falseArrivalWatch.fallbackAt==0 then
+                        falseArrivalWatch.firstAt=now
+                        falseArrivalWatch.fallbackAt=now
+                        falseArrivalWatch.initialMobDistance=hDistance
+                        approachCache=mobCenterApproach(part,target,root.Position.Y)
+                        approachAt=now
+                        clearNavigation()
+                        success=true
+                        info="Rerouting false arrival"
+                    elseif now-falseArrivalWatch.fallbackAt>=cfg.falseArrivalTimeout then
+                        skipMob(target,now,"arrived at waypoint, not monster")
+                        continue
+                    end
+                end
                 local activeWp=nav.waypoints and nav.waypoints[nav.index]
                 local monitoredGoal=activeWp and activeWp.Position or approachCache
                 local stuck,recoveryInfo=monitorMovement(hum,root,monitoredGoal,target,"approach",now)
@@ -2409,7 +2502,7 @@ task.spawn(function()
                     setStatus("Path to "..target.Name..": "..info)
                 else
                     setStatus("Chasing "..target.Name.." ["..info.."] "..
-                        string.format("| mv %.1f st/s",nav.actualSpeed)..
+                        string.format("| mob %.1f st | mv %.1f st/s",hDistance,nav.actualSpeed)..
                         (recoveryInfo and " | "..recoveryInfo or ""))
                 end
             else
@@ -2495,5 +2588,5 @@ end)
 
 setStatus(loadedConfig and "Loaded shared config | "..cfg.targetGroup.." | Anti-AFK "..(cfg.autoAfk and "ON" or "OFF")
     or "Ready | Shared config | Anti-AFK ON")
-print("[RHYE ABOVE] V8 post-control movement + navigation loaded. Shared config: "..CONFIG_FILE)
+print("[RHYE ABOVE] V9 False Arrival + Target Recovery loaded. Shared config: "..CONFIG_FILE)
 print("[RHYE ABOVE] Group: "..cfg.targetGroup.."  AutoReturn: "..tostring(cfg.autoReturn).."  AutoAFK: "..tostring(cfg.autoAfk))
